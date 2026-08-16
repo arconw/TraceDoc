@@ -4,23 +4,76 @@
 
   export let data: MapNodeData;
   export let selected: boolean;
+
+  let hovered = false;
+  let focused = false;
+
+  const ports = [
+    { side: 'top', position: Position.Top },
+    { side: 'right', position: Position.Right },
+    { side: 'bottom', position: Position.Bottom },
+    { side: 'left', position: Position.Left },
+  ] as const;
+
+  $: relationshipSummary = `${data.incomingCount ?? 0} incoming, ${data.outgoingCount ?? 0} outgoing links`;
+
+  function openDocument() {
+    if (data.documentId) data.onOpenDocument?.(data.documentId);
+  }
+
+  function updateTrace() {
+    data.onTraceDocument?.(
+      hovered || focused ? (data.documentId ?? null) : null,
+    );
+  }
+
+  function setHovered(value: boolean) {
+    hovered = value;
+    updateTrace();
+  }
+
+  function setFocused(value: boolean) {
+    focused = value;
+    updateTrace();
+  }
 </script>
 
-<Handle
-  class="map-handle"
-  type="target"
-  position={Position.Left}
-  isConnectable={false}
-  aria-hidden="true"
-  role="presentation"
-  tabindex={-1}
-/>
+{#each ports as port (port.side)}
+  <Handle
+    id={`target-${port.side}`}
+    class="map-handle"
+    type="target"
+    position={port.position}
+    isConnectable={false}
+    aria-hidden="true"
+    role="presentation"
+    tabindex={-1}
+  />
+  <Handle
+    id={`source-${port.side}`}
+    class="map-handle"
+    type="source"
+    position={port.position}
+    isConnectable={false}
+    aria-hidden="true"
+    role="presentation"
+    tabindex={-1}
+  />
+{/each}
 <button
   type="button"
   class:selected
+  class:active={data.emphasis === 'active'}
+  class:connected={data.emphasis === 'connected'}
+  class:muted={data.emphasis === 'muted'}
   title={`${data.label} — ${data.path}`}
-  aria-label={`Open ${data.label}, ${data.path}`}
+  aria-label={`Open ${data.label}, ${data.path}; ${relationshipSummary}`}
   aria-current={selected ? 'page' : undefined}
+  onclick={openDocument}
+  onpointerenter={() => setHovered(true)}
+  onpointerleave={() => setHovered(false)}
+  onfocus={() => setFocused(true)}
+  onblur={() => setFocused(false)}
 >
   <svg viewBox="0 0 16 16" aria-hidden="true">
     <path d="M4 1.75h5l3 3V14.25H4z" />
@@ -31,15 +84,6 @@
     <span>{data.path}</span>
   </span>
 </button>
-<Handle
-  class="map-handle"
-  type="source"
-  position={Position.Right}
-  isConnectable={false}
-  aria-hidden="true"
-  role="presentation"
-  tabindex={-1}
-/>
 
 <style>
   button {
@@ -70,6 +114,23 @@
     box-shadow:
       0 0 0 1px color-mix(in srgb, var(--color-focus) 22%, transparent),
       0 0.25rem 0.8rem rgb(0 0 0 / 18%);
+  }
+
+  button.active {
+    border-color: var(--color-map-edge-active);
+    background: var(--color-selection);
+  }
+
+  button.connected {
+    border-color: color-mix(
+      in srgb,
+      var(--color-map-edge-active) 72%,
+      var(--color-map-document-border)
+    );
+  }
+
+  button.muted {
+    opacity: 0.42;
   }
 
   button:focus-visible {
@@ -116,6 +177,13 @@
     height: 0.4rem;
     border: 1px solid var(--color-map-edge);
     background: var(--color-map-document);
+    opacity: 0;
     pointer-events: none;
+    transition: opacity 90ms ease;
+  }
+
+  :global(.svelte-flow__node-mapDocument:hover .map-handle),
+  :global(.svelte-flow__node-mapDocument:focus-within .map-handle) {
+    opacity: 0.8;
   }
 </style>

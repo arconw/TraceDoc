@@ -19,6 +19,10 @@
 </section>
 
 <style>
+  :global(.svelte-flow__node-mapFolder) {
+    pointer-events: none;
+  }
+
   .map-folder {
     width: 100%;
     height: 100%;

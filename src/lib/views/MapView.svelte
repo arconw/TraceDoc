@@ -4,18 +4,31 @@
     BackgroundVariant,
     Controls,
     SvelteFlow,
-    type Node,
   } from '@xyflow/svelte';
   import ELK from 'elkjs/lib/elk-api.js';
   import ElkWorker from 'elkjs/lib/elk-worker.min.js?worker';
   import { onDestroy, tick } from 'svelte';
+  import { SvelteSet } from 'svelte/reactivity';
   import MapDocumentNode from '../components/MapDocumentNode.svelte';
   import MapFolderNode from '../components/MapFolderNode.svelte';
+  import MapRouteEdge from '../components/MapRouteEdge.svelte';
   import {
     layoutMapGraph,
     type MapFlowEdge,
     type MapFlowNode,
+    type MapLayout,
   } from '../map/elk-layout';
+  import {
+    beginMapLayout,
+    completeEmptyMapLayout,
+    completeMapLayout,
+    createMapEdgeTraceState,
+    createMapLayoutSession,
+    effectiveMapEdgeTraceId,
+    failMapLayout,
+    mapLayoutIsInteractive,
+    reduceMapEdgeTrace,
+  } from '../map/map-view-state';
   import { projectToMapGraph } from '../map/project-graph';
   import type { DocumentId, ProjectModel } from '../types/workspace';
 
@@ -28,12 +41,22 @@
     mapFolder: MapFolderNode,
     mapDocument: MapDocumentNode,
   };
+  const edgeTypes = { mapRoute: MapRouteEdge };
   const elk = new ELK({ workerFactory: () => new ElkWorker() });
 
   let requestedProject: ProjectModel | null = null;
+  let layoutSession = createMapLayoutSession<MapLayout>();
   let layoutNodes: MapFlowNode[] = [];
   let layoutEdges: MapFlowEdge[] = [];
   let nodes: MapFlowNode[] = [];
+  let edges: MapFlowEdge[] = [];
+  let hoveredDocumentId: DocumentId | null = null;
+  let edgeTraceState = createMapEdgeTraceState();
+  let tracedEdgeId: string | null = null;
+  let tracedDocumentId: DocumentId | null = null;
+  let tracedEdge: MapFlowEdge | null = null;
+  let connectedDocumentIds = new SvelteSet<DocumentId>();
+  let traceSummary = '';
   let status: 'loading' | 'ready' | 'empty' | 'error' = 'loading';
   let message: string | null = null;
   let layoutVersion = 0;
@@ -48,11 +71,47 @@
     void updateLayout(project);
   }
 
-  $: nodes = layoutNodes.map((node) =>
-    node.data.kind === 'document'
-      ? { ...node, selected: node.id === selectedDocumentId }
-      : node,
-  );
+  $: layoutNodes = layoutSession.layout?.nodes ?? [];
+  $: layoutEdges = layoutSession.layout?.edges ?? [];
+  $: status = layoutSession.status;
+  $: message = layoutSession.message;
+  $: tracedDocumentId = hoveredDocumentId ?? selectedDocumentId;
+  $: tracedEdgeId = effectiveMapEdgeTraceId(edgeTraceState);
+  $: tracedEdge = tracedEdgeId
+    ? (layoutEdges.find((edge) => edge.id === tracedEdgeId) ?? null)
+    : null;
+  $: connectedDocumentIds = connectedDocuments(layoutEdges, tracedDocumentId);
+  $: nodes = layoutNodes.map((node) => {
+    if (node.data.kind !== 'document') return node;
+    return {
+      ...node,
+      selected: node.id === selectedDocumentId,
+      data: {
+        ...node.data,
+        emphasis: nodeEmphasis(
+          node.id,
+          tracedDocumentId,
+          tracedEdge,
+          connectedDocumentIds,
+        ),
+        onOpenDocument,
+        onTraceDocument: traceDocument,
+      },
+    };
+  });
+  $: edges = layoutEdges.map((edge): MapFlowEdge => ({
+    ...edge,
+    data: {
+      ...edge.data!,
+      emphasis: edgeEmphasis(edge, tracedDocumentId, tracedEdge),
+      onTracePointerEdge: tracePointerEdge,
+    },
+  }));
+  $: traceSummary = tracedEdge
+    ? tracedEdge.data!.ariaLabel
+    : tracedDocumentId
+      ? traceSummaryForDocument(layoutEdges, tracedDocumentId, project)
+      : '';
 
   $: scheduleFlowMount(visible, status, layoutRevision);
 
@@ -129,41 +188,126 @@
   }
 
   async function updateLayout(nextProject: ProjectModel) {
-    const version = ++layoutVersion;
-    const graph = projectToMapGraph(nextProject);
-    message = null;
-
-    if (Object.keys(graph.documents).length === 0) {
-      layoutNodes = [];
-      layoutEdges = [];
-      status = 'empty';
-      return;
-    }
-
-    status = 'loading';
+    layoutSession = beginMapLayout(layoutSession, 'loading');
+    const version = layoutSession.requestId;
+    layoutVersion = version;
+    hoveredDocumentId = null;
+    edgeTraceState = createMapEdgeTraceState();
 
     try {
+      const graph = projectToMapGraph(nextProject);
+      if (Object.keys(graph.documents).length === 0) {
+        layoutSession = completeEmptyMapLayout(layoutSession, version);
+        return;
+      }
       const layout = await layoutMapGraph(graph, elk);
       if (version !== layoutVersion) return;
-      layoutNodes = layout.nodes;
-      layoutEdges = layout.edges;
+      layoutSession = completeMapLayout(layoutSession, version, layout);
       layoutRevision += 1;
-      status = 'ready';
     } catch (error) {
       if (version !== layoutVersion) return;
-      message = error instanceof Error ? error.message : String(error);
-      status = 'error';
+      layoutSession = failMapLayout(
+        layoutSession,
+        version,
+        error instanceof Error ? error.message : String(error),
+      );
     }
   }
 
-  function handleNodeClick({ node }: { node: Node }) {
-    if (node.data.kind === 'document') {
-      onOpenDocument(node.id);
+  function traceDocument(documentId: string | null) {
+    hoveredDocumentId = documentId;
+  }
+
+  function tracePointerEdge(edgeId: string | null) {
+    edgeTraceState = reduceMapEdgeTrace(edgeTraceState, {
+      source: 'pointer',
+      edgeId,
+    });
+  }
+
+  function traceFocusedEdge(edgeId: string | null) {
+    edgeTraceState = reduceMapEdgeTrace(edgeTraceState, {
+      source: 'focus',
+      edgeId,
+    });
+  }
+
+  function connectedDocuments(
+    layout: MapFlowEdge[],
+    documentId: DocumentId | null,
+  ) {
+    const connected = new SvelteSet<DocumentId>();
+    if (!documentId) return connected;
+    for (const edge of layout) {
+      if (edge.source === documentId) connected.add(edge.target);
+      if (edge.target === documentId) connected.add(edge.source);
     }
+    return connected;
+  }
+
+  function nodeEmphasis(
+    documentId: string,
+    activeDocumentId: DocumentId | null,
+    activeEdge: MapFlowEdge | null,
+    connected: SvelteSet<DocumentId>,
+  ): 'normal' | 'active' | 'connected' | 'muted' {
+    if (activeEdge) {
+      return activeEdge.source === documentId ||
+        activeEdge.target === documentId
+        ? 'active'
+        : 'muted';
+    }
+    if (!activeDocumentId) return 'normal';
+    if (documentId === activeDocumentId) return 'active';
+    return connected.has(documentId) ? 'connected' : 'muted';
+  }
+
+  function edgeEmphasis(
+    edge: MapFlowEdge,
+    activeDocumentId: DocumentId | null,
+    activeEdge: MapFlowEdge | null,
+  ): 'normal' | 'active' | 'muted' {
+    if (activeEdge) return edge.id === activeEdge.id ? 'active' : 'muted';
+    if (!activeDocumentId) return 'normal';
+    return edge.source === activeDocumentId || edge.target === activeDocumentId
+      ? 'active'
+      : 'muted';
+  }
+
+  function traceSummaryForDocument(
+    layout: MapFlowEdge[],
+    documentId: DocumentId,
+    nextProject: ProjectModel,
+  ) {
+    let incoming = 0;
+    let outgoing = 0;
+    for (const edge of layout) {
+      if (edge.source === documentId) outgoing += 1;
+      if (edge.target === documentId) incoming += 1;
+    }
+    const document = nextProject.documents[documentId];
+    return document
+      ? `${document.title ?? document.name}: ${incoming} incoming and ${outgoing} outgoing links`
+      : '';
   }
 </script>
 
 <section class="map-view" aria-label="Architecture map">
+  <p class="visually-hidden" aria-live="polite">{traceSummary}</p>
+  {#if mapLayoutIsInteractive(layoutSession, visible, flowReady)}
+    <div class="edge-keyboard-targets">
+      {#each layoutEdges as edge (edge.id)}
+        <button
+          type="button"
+          aria-label={edge.data!.ariaLabel}
+          aria-pressed={edgeTraceState.focusedEdgeId === edge.id}
+          onfocus={() => traceFocusedEdge(edge.id)}
+          onblur={() => traceFocusedEdge(null)}
+          onclick={() => traceFocusedEdge(edge.id)}
+        ></button>
+      {/each}
+    </div>
+  {/if}
   {#if status === 'empty'}
     <div class="map-state">
       <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -190,8 +334,9 @@
         {#key layoutRevision}
           <SvelteFlow
             {nodes}
-            edges={layoutEdges}
+            {edges}
             {nodeTypes}
+            {edgeTypes}
             fitView
             fitViewOptions={{ padding: 0.12, maxZoom: 1 }}
             minZoom={0.08}
@@ -201,9 +346,9 @@
             elementsSelectable={false}
             nodesFocusable={false}
             edgesFocusable={false}
+            zIndexMode="manual"
             deleteKey={null}
             onlyRenderVisibleElements
-            onnodeclick={handleNodeClick}
             aria-label="Interactive architecture map"
           >
             <Background
@@ -321,9 +466,24 @@
     transform: translateX(-50%);
   }
 
-  .map-view :global(.svelte-flow__edge-path) {
-    stroke: var(--color-map-edge);
-    stroke-width: 1.25;
+  .visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .edge-keyboard-targets {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
   }
 
   .map-view :global(.svelte-flow__controls) {

@@ -1,6 +1,12 @@
 import type { Edge, Node } from '@xyflow/svelte';
 import type { ELK, ElkExtendedEdge, ElkNode } from 'elkjs/lib/elk-api';
 import type { MapGraph } from './project-graph';
+import {
+  routeMapLinks,
+  type MapBoundaryGateway,
+  type MapPoint,
+  type MapSide,
+} from './routing';
 
 const DOCUMENT_HEIGHT = 58;
 const DOCUMENT_MIN_WIDTH = 176;
@@ -13,10 +19,28 @@ export interface MapNodeData extends Record<string, unknown> {
   label: string;
   name: string;
   path: string;
+  documentId?: string;
+  incomingCount?: number;
+  outgoingCount?: number;
+  emphasis?: 'normal' | 'active' | 'connected' | 'muted';
+  onOpenDocument?: (documentId: string) => void;
+  onTraceDocument?: (documentId: string | null) => void;
 }
 
 export type MapFlowNode = Node<MapNodeData, 'mapFolder' | 'mapDocument'>;
-export type MapFlowEdge = Edge<Record<string, never>, 'smoothstep'>;
+export interface MapEdgeData extends Record<string, unknown> {
+  points: MapPoint[];
+  sourceDocumentId: string;
+  targetDocumentId: string;
+  sourceSide: MapSide;
+  targetSide: MapSide;
+  boundaryGateways: MapBoundaryGateway[];
+  ariaLabel: string;
+  emphasis?: 'normal' | 'active' | 'muted';
+  onTracePointerEdge?: (edgeId: string | null) => void;
+}
+
+export type MapFlowEdge = Edge<MapEdgeData, 'mapRoute'>;
 
 interface ElkMapNode extends ElkNode {
   mapKind: 'folder' | 'document';
@@ -43,6 +67,8 @@ export async function layoutMapGraph(
 
 export function elkGraphToFlow(graph: MapGraph, layout: ElkMapNode): MapLayout {
   const nodes: MapFlowNode[] = [];
+  const incomingCounts = linkCounts(graph, 'targetDocumentId');
+  const outgoingCounts = linkCounts(graph, 'sourceDocumentId');
 
   function visit(children: ElkMapNode[], parentId?: string) {
     for (const child of children) {
@@ -58,6 +84,7 @@ export function elkGraphToFlow(graph: MapGraph, layout: ElkMapNode): MapLayout {
           width: child.width ?? 200,
           height: child.height ?? 96,
           parentId,
+          zIndex: 0,
           draggable: false,
           selectable: false,
           connectable: false,
@@ -81,6 +108,7 @@ export function elkGraphToFlow(graph: MapGraph, layout: ElkMapNode): MapLayout {
           width: child.width ?? DOCUMENT_MIN_WIDTH,
           height: child.height ?? DOCUMENT_HEIGHT,
           parentId,
+          zIndex: 2,
           draggable: false,
           selectable: false,
           connectable: false,
@@ -91,6 +119,9 @@ export function elkGraphToFlow(graph: MapGraph, layout: ElkMapNode): MapLayout {
             label: document.title,
             name: document.name,
             path: document.path,
+            documentId: document.id,
+            incomingCount: incomingCounts[document.id] ?? 0,
+            outgoingCount: outgoingCounts[document.id] ?? 0,
           },
         });
       }
@@ -98,25 +129,45 @@ export function elkGraphToFlow(graph: MapGraph, layout: ElkMapNode): MapLayout {
   }
 
   visit(layout.children ?? []);
+  const routes = routeMapLinks(graph, nodes);
 
   return {
     nodes,
-    edges: graph.links.map((link) => ({
-      id: link.id,
-      source: link.sourceDocumentId,
-      target: link.targetDocumentId,
-      type: 'smoothstep',
-      markerEnd: {
-        type: 'arrowclosed',
-        color: '#7c899e',
-        width: 14,
-        height: 14,
-      },
-      focusable: false,
-      selectable: false,
-      deletable: false,
-      interactionWidth: 10,
-    })),
+    edges: graph.links.flatMap((link) => {
+      const route = routes[link.id];
+      if (!route) return [];
+      const source = graph.documents[link.sourceDocumentId];
+      const target = graph.documents[link.targetDocumentId];
+      return [
+        {
+          id: link.id,
+          source: link.sourceDocumentId,
+          target: link.targetDocumentId,
+          sourceHandle: `source-${route.sourceSide}`,
+          targetHandle: `target-${route.targetSide}`,
+          type: 'mapRoute' as const,
+          zIndex: 1,
+          markerEnd: {
+            type: 'arrowclosed' as const,
+            color: '#7c899e',
+            width: 11,
+            height: 11,
+          },
+          ariaRole: 'presentation' as const,
+          domAttributes: { 'aria-hidden': 'true' },
+          focusable: false,
+          selectable: false,
+          deletable: false,
+          interactionWidth: 12,
+          data: {
+            ...route,
+            sourceDocumentId: link.sourceDocumentId,
+            targetDocumentId: link.targetDocumentId,
+            ariaLabel: `${source.title} references ${target.title}`,
+          },
+        },
+      ];
+    }),
   };
 }
 
@@ -149,7 +200,13 @@ async function layoutFolder(
   const layoutInput: ElkNode = {
     id: `layout:${folder.id}`,
     layoutOptions: layoutOptions(),
-    children: children.map(({ id, width, height }) => ({ id, width, height })),
+    children: children.map(({ id, width, height }) => ({
+      id,
+      width,
+      height,
+      layoutOptions: { 'elk.portConstraints': 'FIXED_SIDE' },
+      ports: fixedSidePorts(id),
+    })),
     edges: layoutEdgesForFolder(graph, folder.id),
   };
   const positioned = await engine.layout(layoutInput);
@@ -210,7 +267,7 @@ function layoutEdgesForFolder(
   graph: MapGraph,
   folderId: string,
 ): ElkExtendedEdge[] {
-  const edges = new Map<string, ElkExtendedEdge>();
+  const edges: ElkExtendedEdge[] = [];
 
   for (const link of graph.links) {
     const source = directChildForDocument(
@@ -225,17 +282,14 @@ function layoutEdgesForFolder(
     );
 
     if (!source || !target || source === target) continue;
-    const pairId = `${source}\u0000${target}`;
-    if (!edges.has(pairId)) {
-      edges.set(pairId, {
-        id: `layout:${folderId}:${link.id}`,
-        sources: [source],
-        targets: [target],
-      });
-    }
+    edges.push({
+      id: `layout:${folderId}:${link.id}`,
+      sources: [`${source}:right`],
+      targets: [`${target}:left`],
+    });
   }
 
-  return [...edges.values()];
+  return edges;
 }
 
 function directChildForDocument(
@@ -276,11 +330,43 @@ function layoutOptions() {
     'elk.algorithm': 'layered',
     'elk.direction': 'RIGHT',
     'elk.edgeRouting': 'ORTHOGONAL',
+    'elk.layered.crossingMinimization.strategy': 'LAYER_SWEEP',
     'elk.layered.considerModelOrder.strategy': 'NODES_AND_EDGES',
-    'elk.layered.spacing.nodeNodeBetweenLayers': '72',
+    'elk.layered.highDegreeNodes.threshold': '8',
+    'elk.layered.highDegreeNodes.treatment': 'true',
+    'elk.layered.mergeEdges': 'false',
+    'elk.layered.nodePlacement.favorStraightEdges': 'true',
+    'elk.layered.nodePlacement.strategy': 'NETWORK_SIMPLEX',
+    'elk.layered.spacing.edgeEdgeBetweenLayers': '10',
+    'elk.layered.spacing.edgeNodeBetweenLayers': '24',
+    'elk.layered.spacing.nodeNodeBetweenLayers': '88',
+    'elk.layered.unnecessaryBendpoints': 'true',
     'elk.randomSeed': '1',
     'elk.separateConnectedComponents': 'false',
     'elk.spacing.componentComponent': '52',
-    'elk.spacing.nodeNode': '36',
+    'elk.spacing.edgeEdge': '10',
+    'elk.spacing.edgeNode': '24',
+    'elk.spacing.nodeNode': '44',
   };
+}
+
+function fixedSidePorts(nodeId: string) {
+  return (['top', 'right', 'bottom', 'left'] as const).map((side) => ({
+    id: `${nodeId}:${side}`,
+    width: 1,
+    height: 1,
+    layoutOptions: {
+      'elk.port.side': side.toUpperCase(),
+    },
+  }));
+}
+
+function linkCounts(
+  graph: MapGraph,
+  field: 'sourceDocumentId' | 'targetDocumentId',
+) {
+  return graph.links.reduce<Record<string, number>>((counts, link) => {
+    counts[link[field]] = (counts[link[field]] ?? 0) + 1;
+    return counts;
+  }, {});
 }

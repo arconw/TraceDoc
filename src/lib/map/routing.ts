@@ -1,0 +1,786 @@
+import type { MapGraph, MapLink } from './project-graph';
+
+export type MapSide = 'top' | 'right' | 'bottom' | 'left';
+
+export interface MapPoint {
+  x: number;
+  y: number;
+}
+
+export interface MapBoundaryGateway {
+  folderId: string;
+  point: MapPoint;
+  side: MapSide;
+}
+
+export interface MapRoute {
+  points: MapPoint[];
+  sourceSide: MapSide;
+  targetSide: MapSide;
+  boundaryGateways: MapBoundaryGateway[];
+}
+
+export interface RoutableMapNode {
+  id: string;
+  parentId?: string;
+  position: MapPoint;
+  width?: number;
+  height?: number;
+  data: { kind: 'folder' | 'document' };
+}
+
+export interface MapRect extends MapPoint {
+  width: number;
+  height: number;
+}
+
+interface RouteDescriptor {
+  link: MapLink;
+  source: MapRect;
+  target: MapRect;
+  sourceSide: MapSide;
+  targetSide: MapSide;
+  sourceBoundaries: string[];
+  targetBoundaries: string[];
+  lcaId: string;
+}
+
+interface RankedMember {
+  id: string;
+  order: number;
+}
+
+interface HeapEntry {
+  state: number;
+  cost: number;
+}
+
+const PORT_INSET = 10;
+const PORT_SPACING = 8;
+const GATEWAY_SPACING = 10;
+const ROUTE_CLEARANCE = 8;
+const FOLDER_INSET = 4;
+const BEND_COST = 20;
+const SHARED_SEGMENT_COST = 12;
+
+export function routeMapLinks(
+  graph: MapGraph,
+  nodes: RoutableMapNode[],
+): Record<string, MapRoute> {
+  const rectangles = absoluteRectangles(nodes);
+  const descriptors = graph.links
+    .map((link) => descriptorForLink(graph, rectangles, link))
+    .filter((descriptor): descriptor is RouteDescriptor => descriptor !== null);
+  const portGroups = buildPortGroups(descriptors);
+  const gatewayGroups = buildGatewayGroups(descriptors);
+  const zoneRouters = buildZoneRouters(graph, rectangles);
+  const routes: Record<string, MapRoute> = {};
+
+  for (const descriptor of descriptors) {
+    const sourcePoint = portPoint(
+      descriptor.source,
+      descriptor.sourceSide,
+      rankFor(
+        portGroups,
+        portKey(descriptor.link.sourceDocumentId, descriptor.sourceSide, true),
+        descriptor.link.id,
+      ),
+    );
+    const targetPoint = portPoint(
+      descriptor.target,
+      descriptor.targetSide,
+      rankFor(
+        portGroups,
+        portKey(descriptor.link.targetDocumentId, descriptor.targetSide, false),
+        descriptor.link.id,
+      ),
+    );
+    const points = [sourcePoint];
+    const boundaryGateways: MapBoundaryGateway[] = [];
+    let current = movePoint(
+      sourcePoint,
+      descriptor.sourceSide,
+      ROUTE_CLEARANCE,
+    );
+    let currentZone =
+      graph.documents[descriptor.link.sourceDocumentId].parentId;
+    pushPoint(points, current);
+
+    for (const folderId of descriptor.sourceBoundaries) {
+      const gateway = routeGateway(
+        rectangles[folderId],
+        folderId,
+        descriptor.sourceSide,
+        gatewayGroups,
+        descriptor.link.id,
+      );
+      const inside = movePoint(
+        gateway.point,
+        oppositeSide(gateway.side),
+        ROUTE_CLEARANCE,
+      );
+      appendRoute(points, zoneRouters[currentZone].route(current, inside));
+      pushPoint(points, gateway.point);
+      current = movePoint(gateway.point, gateway.side, ROUTE_CLEARANCE);
+      pushPoint(points, current);
+      boundaryGateways.push(gateway);
+      currentZone = graph.folders[folderId].parentId!;
+    }
+
+    if (currentZone !== descriptor.lcaId) {
+      throw new Error(`Unable to ascend route ${descriptor.link.id}`);
+    }
+
+    for (const folderId of [...descriptor.targetBoundaries].reverse()) {
+      const gateway = routeGateway(
+        rectangles[folderId],
+        folderId,
+        descriptor.targetSide,
+        gatewayGroups,
+        descriptor.link.id,
+      );
+      const outside = movePoint(gateway.point, gateway.side, ROUTE_CLEARANCE);
+      appendRoute(points, zoneRouters[currentZone].route(current, outside));
+      pushPoint(points, gateway.point);
+      current = movePoint(
+        gateway.point,
+        oppositeSide(gateway.side),
+        ROUTE_CLEARANCE,
+      );
+      pushPoint(points, current);
+      boundaryGateways.push(gateway);
+      currentZone = folderId;
+    }
+
+    const targetLead = movePoint(
+      targetPoint,
+      descriptor.targetSide,
+      ROUTE_CLEARANCE,
+    );
+    appendRoute(points, zoneRouters[currentZone].route(current, targetLead));
+    pushPoint(points, targetPoint);
+
+    routes[descriptor.link.id] = {
+      points: deduplicatePoints(points),
+      sourceSide: descriptor.sourceSide,
+      targetSide: descriptor.targetSide,
+      boundaryGateways,
+    };
+  }
+
+  return routes;
+}
+
+export function segmentIntersectsRectInterior(
+  source: MapPoint,
+  target: MapPoint,
+  rect: MapRect,
+) {
+  if (source.x === target.x) {
+    if (source.x <= rect.x || source.x >= rect.x + rect.width) return false;
+    const minimum = Math.min(source.y, target.y);
+    const maximum = Math.max(source.y, target.y);
+    return maximum > rect.y && minimum < rect.y + rect.height;
+  }
+  if (source.y === target.y) {
+    if (source.y <= rect.y || source.y >= rect.y + rect.height) return false;
+    const minimum = Math.min(source.x, target.x);
+    const maximum = Math.max(source.x, target.x);
+    return maximum > rect.x && minimum < rect.x + rect.width;
+  }
+  return true;
+}
+
+function descriptorForLink(
+  graph: MapGraph,
+  rectangles: Record<string, MapRect>,
+  link: MapLink,
+): RouteDescriptor | null {
+  const source = rectangles[link.sourceDocumentId];
+  const target = rectangles[link.targetDocumentId];
+  const sourceDocument = graph.documents[link.sourceDocumentId];
+  const targetDocument = graph.documents[link.targetDocumentId];
+  if (!source || !target || !sourceDocument || !targetDocument) return null;
+  const sides =
+    link.sourceDocumentId === link.targetDocumentId
+      ? ({ source: 'right', target: 'bottom' } as const)
+      : facingSides(source, target);
+  const boundaries = boundaryChains(
+    graph,
+    sourceDocument.parentId,
+    targetDocument.parentId,
+  );
+
+  return {
+    link,
+    source,
+    target,
+    sourceSide: sides.source,
+    targetSide: sides.target,
+    sourceBoundaries: boundaries.source,
+    targetBoundaries: boundaries.target,
+    lcaId: boundaries.lcaId,
+  };
+}
+
+function absoluteRectangles(nodes: RoutableMapNode[]) {
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  const positions = new Map<string, MapPoint>();
+
+  function absolutePosition(id: string): MapPoint {
+    const cached = positions.get(id);
+    if (cached) return cached;
+    const node = byId.get(id);
+    if (!node) return { x: 0, y: 0 };
+    const parent = node.parentId
+      ? absolutePosition(node.parentId)
+      : { x: 0, y: 0 };
+    const position = {
+      x: parent.x + node.position.x,
+      y: parent.y + node.position.y,
+    };
+    positions.set(id, position);
+    return position;
+  }
+
+  return nodes.reduce<Record<string, MapRect>>((result, node) => {
+    result[node.id] = {
+      ...absolutePosition(node.id),
+      width: node.width ?? 0,
+      height: node.height ?? 0,
+    };
+    return result;
+  }, {});
+}
+
+function facingSides(source: MapRect, target: MapRect) {
+  const deltaX = centerX(target) - centerX(source);
+  const deltaY = centerY(target) - centerY(source);
+  if (Math.abs(deltaX) >= Math.abs(deltaY)) {
+    return deltaX >= 0
+      ? ({ source: 'right', target: 'left' } as const)
+      : ({ source: 'left', target: 'right' } as const);
+  }
+  return deltaY >= 0
+    ? ({ source: 'bottom', target: 'top' } as const)
+    : ({ source: 'top', target: 'bottom' } as const);
+}
+
+function boundaryChains(
+  graph: MapGraph,
+  sourceFolderId: string,
+  targetFolderId: string,
+) {
+  const source = ancestors(graph, sourceFolderId);
+  const target = ancestors(graph, targetFolderId);
+  let lcaId = source.at(-1)!;
+
+  while (
+    source.length > 0 &&
+    target.length > 0 &&
+    source.at(-1) === target.at(-1)
+  ) {
+    lcaId = source.pop()!;
+    target.pop();
+  }
+
+  return { source, target, lcaId };
+}
+
+function ancestors(graph: MapGraph, folderId: string) {
+  const result: string[] = [];
+  let current: (typeof graph.folders)[string] | undefined =
+    graph.folders[folderId];
+  while (current) {
+    result.push(current.id);
+    current = current.parentId ? graph.folders[current.parentId] : undefined;
+  }
+  return result;
+}
+
+function buildZoneRouters(
+  graph: MapGraph,
+  rectangles: Record<string, MapRect>,
+) {
+  return Object.values(graph.folders).reduce<Record<string, ZoneRouter>>(
+    (routers, folder) => {
+      const obstacles = [
+        ...folder.documentIds.map((id) => rectangles[id]),
+        ...folder.childFolderIds.map((id) => rectangles[id]),
+      ]
+        .filter((rect): rect is MapRect => Boolean(rect))
+        .map((rect) => inflateRect(rect, ROUTE_CLEARANCE));
+      routers[folder.id] = new ZoneRouter(
+        insetRect(rectangles[folder.id], FOLDER_INSET),
+        obstacles,
+      );
+      return routers;
+    },
+    {},
+  );
+}
+
+class ZoneRouter {
+  private readonly usage = new Map<string, number>();
+
+  constructor(
+    private readonly bounds: MapRect,
+    private readonly obstacles: MapRect[],
+  ) {}
+
+  route(source: MapPoint, target: MapPoint) {
+    if (source.x === target.x || source.y === target.y) {
+      if (this.segmentClear(source, target)) {
+        this.reserve([source, target]);
+        return [source, target];
+      }
+    }
+
+    const xs = uniqueNumbers([
+      this.bounds.x,
+      this.bounds.x + this.bounds.width,
+      source.x,
+      target.x,
+      ...this.obstacles.flatMap((rect) => [rect.x, rect.x + rect.width]),
+    ]);
+    const ys = uniqueNumbers([
+      this.bounds.y,
+      this.bounds.y + this.bounds.height,
+      source.y,
+      target.y,
+      ...this.obstacles.flatMap((rect) => [rect.y, rect.y + rect.height]),
+    ]);
+    const width = xs.length;
+    const height = ys.length;
+    const valid = new Uint8Array(width * height);
+
+    for (let yIndex = 0; yIndex < height; yIndex += 1) {
+      for (let xIndex = 0; xIndex < width; xIndex += 1) {
+        const point = { x: xs[xIndex], y: ys[yIndex] };
+        if (this.pointValid(point)) valid[yIndex * width + xIndex] = 1;
+      }
+    }
+
+    const sourceIndex = ys.indexOf(source.y) * width + xs.indexOf(source.x);
+    const targetIndex = ys.indexOf(target.y) * width + xs.indexOf(target.x);
+    const stateCount = width * height * 3;
+    const distances = new Float64Array(stateCount);
+    distances.fill(Number.POSITIVE_INFINITY);
+    const previous = new Int32Array(stateCount);
+    previous.fill(-1);
+    const heap = new MinHeap();
+    const initialState = sourceIndex * 3;
+    distances[initialState] = 0;
+    heap.push({ state: initialState, cost: 0 });
+    let finalState = -1;
+
+    while (heap.size > 0) {
+      const entry = heap.pop()!;
+      if (entry.cost !== distances[entry.state]) continue;
+      const nodeIndex = Math.floor(entry.state / 3);
+      const direction = entry.state % 3;
+      if (nodeIndex === targetIndex) {
+        finalState = entry.state;
+        break;
+      }
+      const xIndex = nodeIndex % width;
+      const yIndex = Math.floor(nodeIndex / width);
+      const neighbors = [
+        [xIndex - 1, yIndex, 1],
+        [xIndex + 1, yIndex, 1],
+        [xIndex, yIndex - 1, 2],
+        [xIndex, yIndex + 1, 2],
+      ] as const;
+
+      for (const [nextX, nextY, nextDirection] of neighbors) {
+        if (nextX < 0 || nextX >= width || nextY < 0 || nextY >= height) {
+          continue;
+        }
+        const nextIndex = nextY * width + nextX;
+        if (!valid[nextIndex]) continue;
+        const from = { x: xs[xIndex], y: ys[yIndex] };
+        const to = { x: xs[nextX], y: ys[nextY] };
+        if (!this.segmentClear(from, to)) continue;
+        const segment = segmentKey(from, to);
+        const distance = Math.abs(to.x - from.x) + Math.abs(to.y - from.y);
+        const cost =
+          entry.cost +
+          distance +
+          (direction !== 0 && direction !== nextDirection ? BEND_COST : 0) +
+          (this.usage.get(segment) ?? 0) * SHARED_SEGMENT_COST;
+        const nextState = nextIndex * 3 + nextDirection;
+        if (cost >= distances[nextState]) continue;
+        distances[nextState] = cost;
+        previous[nextState] = entry.state;
+        heap.push({ state: nextState, cost });
+      }
+    }
+
+    if (finalState < 0) {
+      throw new Error(
+        `Unable to route inside ${this.bounds.x},${this.bounds.y},${this.bounds.width},${this.bounds.height}`,
+      );
+    }
+
+    const reversed: MapPoint[] = [];
+    let state = finalState;
+    while (state >= 0) {
+      const nodeIndex = Math.floor(state / 3);
+      reversed.push({
+        x: xs[nodeIndex % width],
+        y: ys[Math.floor(nodeIndex / width)],
+      });
+      state = previous[state];
+    }
+    const route = compactPoints(reversed.reverse());
+    this.reserve(route);
+    return route;
+  }
+
+  private pointValid(point: MapPoint) {
+    if (
+      point.x < this.bounds.x ||
+      point.x > this.bounds.x + this.bounds.width ||
+      point.y < this.bounds.y ||
+      point.y > this.bounds.y + this.bounds.height
+    ) {
+      return false;
+    }
+    return !this.obstacles.some((rect) => pointInsideRect(point, rect));
+  }
+
+  private segmentClear(source: MapPoint, target: MapPoint) {
+    return !this.obstacles.some((rect) =>
+      segmentIntersectsRectInterior(source, target, rect),
+    );
+  }
+
+  private reserve(points: MapPoint[]) {
+    for (let index = 1; index < points.length; index += 1) {
+      const key = segmentKey(points[index - 1], points[index]);
+      this.usage.set(key, (this.usage.get(key) ?? 0) + 1);
+    }
+  }
+}
+
+class MinHeap {
+  private readonly values: HeapEntry[] = [];
+
+  get size() {
+    return this.values.length;
+  }
+
+  push(entry: HeapEntry) {
+    this.values.push(entry);
+    let index = this.values.length - 1;
+    while (index > 0) {
+      const parent = Math.floor((index - 1) / 2);
+      if (!entryBefore(this.values[index], this.values[parent])) break;
+      [this.values[index], this.values[parent]] = [
+        this.values[parent],
+        this.values[index],
+      ];
+      index = parent;
+    }
+  }
+
+  pop() {
+    if (this.values.length === 0) return undefined;
+    const first = this.values[0];
+    const last = this.values.pop()!;
+    if (this.values.length === 0) return first;
+    this.values[0] = last;
+    let index = 0;
+    while (true) {
+      const left = index * 2 + 1;
+      const right = left + 1;
+      let smallest = index;
+      if (
+        left < this.values.length &&
+        entryBefore(this.values[left], this.values[smallest])
+      ) {
+        smallest = left;
+      }
+      if (
+        right < this.values.length &&
+        entryBefore(this.values[right], this.values[smallest])
+      ) {
+        smallest = right;
+      }
+      if (smallest === index) break;
+      [this.values[index], this.values[smallest]] = [
+        this.values[smallest],
+        this.values[index],
+      ];
+      index = smallest;
+    }
+    return first;
+  }
+}
+
+function buildPortGroups(descriptors: RouteDescriptor[]) {
+  const groups = new Map<string, RankedMember[]>();
+  for (const descriptor of descriptors) {
+    addRankedMember(
+      groups,
+      portKey(descriptor.link.sourceDocumentId, descriptor.sourceSide, true),
+      descriptor.link.id,
+      perpendicularCenter(descriptor.target, descriptor.sourceSide),
+    );
+    addRankedMember(
+      groups,
+      portKey(descriptor.link.targetDocumentId, descriptor.targetSide, false),
+      descriptor.link.id,
+      perpendicularCenter(descriptor.source, descriptor.targetSide),
+    );
+  }
+  sortGroups(groups);
+  return groups;
+}
+
+function buildGatewayGroups(descriptors: RouteDescriptor[]) {
+  const groups = new Map<string, RankedMember[]>();
+  for (const descriptor of descriptors) {
+    for (const folderId of descriptor.sourceBoundaries) {
+      addRankedMember(
+        groups,
+        gatewayKey(folderId, descriptor.sourceSide),
+        descriptor.link.id,
+        perpendicularCenter(descriptor.source, descriptor.sourceSide),
+      );
+    }
+    for (const folderId of descriptor.targetBoundaries) {
+      addRankedMember(
+        groups,
+        gatewayKey(folderId, descriptor.targetSide),
+        descriptor.link.id,
+        perpendicularCenter(descriptor.target, descriptor.targetSide),
+      );
+    }
+  }
+  sortGroups(groups);
+  return groups;
+}
+
+function routeGateway(
+  rect: MapRect,
+  folderId: string,
+  side: MapSide,
+  groups: Map<string, RankedMember[]>,
+  edgeId: string,
+): MapBoundaryGateway {
+  return {
+    folderId,
+    side,
+    point: gatewayPoint(
+      rect,
+      side,
+      rankFor(groups, gatewayKey(folderId, side), edgeId),
+    ),
+  };
+}
+
+function addRankedMember(
+  groups: Map<string, RankedMember[]>,
+  key: string,
+  id: string,
+  order: number,
+) {
+  const group = groups.get(key) ?? [];
+  group.push({ id, order });
+  groups.set(key, group);
+}
+
+function sortGroups(groups: Map<string, RankedMember[]>) {
+  for (const group of groups.values()) {
+    group.sort(
+      (left, right) => left.order - right.order || compare(left.id, right.id),
+    );
+  }
+}
+
+function rankFor(groups: Map<string, RankedMember[]>, key: string, id: string) {
+  const group = groups.get(key) ?? [];
+  return {
+    index: Math.max(
+      0,
+      group.findIndex((member) => member.id === id),
+    ),
+    count: Math.max(1, group.length),
+  };
+}
+
+function portPoint(
+  rect: MapRect,
+  side: MapSide,
+  rank: { index: number; count: number },
+) {
+  const horizontalSide = side === 'left' || side === 'right';
+  const length = horizontalSide ? rect.height : rect.width;
+  return pointOnRect(
+    rect,
+    side,
+    distributedOffset(length / 2, length - PORT_INSET * 2, rank, PORT_SPACING),
+  );
+}
+
+function gatewayPoint(
+  rect: MapRect,
+  side: MapSide,
+  rank: { index: number; count: number },
+) {
+  const horizontalSide = side === 'left' || side === 'right';
+  const start = horizontalSide ? Math.min(52, rect.height / 3) : 14;
+  const length = horizontalSide ? rect.height : rect.width;
+  const available = Math.max(0, length - start - 14);
+  return pointOnRect(
+    rect,
+    side,
+    distributedOffset(start + available / 2, available, rank, GATEWAY_SPACING),
+  );
+}
+
+function pointOnRect(rect: MapRect, side: MapSide, offset: number): MapPoint {
+  if (side === 'left') return { x: rect.x, y: rect.y + offset };
+  if (side === 'right') {
+    return { x: rect.x + rect.width, y: rect.y + offset };
+  }
+  if (side === 'top') return { x: rect.x + offset, y: rect.y };
+  return { x: rect.x + offset, y: rect.y + rect.height };
+}
+
+function distributedOffset(
+  center: number,
+  available: number,
+  rank: { index: number; count: number },
+  preferredSpacing: number,
+) {
+  const spacing =
+    rank.count <= 1
+      ? 0
+      : Math.min(preferredSpacing, available / (rank.count - 1));
+  return center + (rank.index - (rank.count - 1) / 2) * spacing;
+}
+
+function movePoint(point: MapPoint, side: MapSide, distance: number) {
+  if (side === 'left') return { x: point.x - distance, y: point.y };
+  if (side === 'right') return { x: point.x + distance, y: point.y };
+  if (side === 'top') return { x: point.x, y: point.y - distance };
+  return { x: point.x, y: point.y + distance };
+}
+
+function appendRoute(points: MapPoint[], route: MapPoint[]) {
+  for (const point of route) pushPoint(points, point);
+}
+
+function compactPoints(points: MapPoint[]) {
+  const result: MapPoint[] = [];
+  for (const point of points) {
+    const previous = result.at(-1);
+    if (previous?.x === point.x && previous.y === point.y) continue;
+    const beforePrevious = result.at(-2);
+    if (
+      beforePrevious &&
+      previous &&
+      ((beforePrevious.x === previous.x && previous.x === point.x) ||
+        (beforePrevious.y === previous.y && previous.y === point.y))
+    ) {
+      result[result.length - 1] = point;
+    } else {
+      result.push(point);
+    }
+  }
+  return result;
+}
+
+function deduplicatePoints(points: MapPoint[]) {
+  return points.filter(
+    (point, index) =>
+      index === 0 ||
+      point.x !== points[index - 1].x ||
+      point.y !== points[index - 1].y,
+  );
+}
+
+function pushPoint(points: MapPoint[], point: MapPoint) {
+  const previous = points.at(-1);
+  if (previous?.x !== point.x || previous.y !== point.y) points.push(point);
+}
+
+function inflateRect(rect: MapRect, amount: number): MapRect {
+  return {
+    x: rect.x - amount,
+    y: rect.y - amount,
+    width: rect.width + amount * 2,
+    height: rect.height + amount * 2,
+  };
+}
+
+function insetRect(rect: MapRect, amount: number): MapRect {
+  return {
+    x: rect.x + amount,
+    y: rect.y + amount,
+    width: Math.max(0, rect.width - amount * 2),
+    height: Math.max(0, rect.height - amount * 2),
+  };
+}
+
+function pointInsideRect(point: MapPoint, rect: MapRect) {
+  return (
+    point.x > rect.x &&
+    point.x < rect.x + rect.width &&
+    point.y > rect.y &&
+    point.y < rect.y + rect.height
+  );
+}
+
+function uniqueNumbers(values: number[]) {
+  return [...new Set(values)].sort((left, right) => left - right);
+}
+
+function segmentKey(source: MapPoint, target: MapPoint) {
+  const first =
+    source.x < target.x || (source.x === target.x && source.y <= target.y)
+      ? source
+      : target;
+  const second = first === source ? target : source;
+  return `${first.x},${first.y}:${second.x},${second.y}`;
+}
+
+function portKey(documentId: string, side: MapSide, source: boolean) {
+  return `${documentId}:${side}:${source ? 'source' : 'target'}`;
+}
+
+function gatewayKey(folderId: string, side: MapSide) {
+  return `${folderId}:${side}`;
+}
+
+function perpendicularCenter(rect: MapRect, side: MapSide) {
+  return side === 'left' || side === 'right' ? centerY(rect) : centerX(rect);
+}
+
+function centerX(rect: MapRect) {
+  return rect.x + rect.width / 2;
+}
+
+function centerY(rect: MapRect) {
+  return rect.y + rect.height / 2;
+}
+
+function oppositeSide(side: MapSide): MapSide {
+  if (side === 'left') return 'right';
+  if (side === 'right') return 'left';
+  if (side === 'top') return 'bottom';
+  return 'top';
+}
+
+function entryBefore(left: HeapEntry, right: HeapEntry) {
+  return (
+    left.cost < right.cost ||
+    (left.cost === right.cost && left.state < right.state)
+  );
+}
+
+function compare(left: string, right: string) {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
