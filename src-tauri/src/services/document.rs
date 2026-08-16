@@ -11,6 +11,7 @@ use crate::{
         },
     },
 };
+use notify::RecommendedWatcher;
 use std::{
     collections::{BTreeSet, VecDeque},
     fmt, fs,
@@ -45,6 +46,16 @@ struct ActiveWorkspace {
     self_writes: std::collections::BTreeMap<String, SelfWrite>,
     revision: u64,
     history: VecDeque<WorkspacePatch>,
+    /// The native watcher currently delivering live updates for this
+    /// workspace, if `WorkspaceWatcher::finish` has installed one yet.
+    /// Kept inside the same lock-protected state as `generation`/`root` so
+    /// that installing a new watcher can be gated atomically on the
+    /// generation still being current (see `install_watcher`), and so that
+    /// activating a *new* workspace - which replaces this struct wholesale -
+    /// is the only thing that ever retires this watcher. A scan or
+    /// activation that fails for a *new* root never reaches that point, so
+    /// this watcher (and this workspace's live updates) is left untouched.
+    watcher: Option<RecommendedWatcher>,
 }
 
 struct SelfWrite {
@@ -94,8 +105,40 @@ impl WorkspaceSession {
             self_writes: std::collections::BTreeMap::new(),
             revision: 1,
             history: VecDeque::new(),
+            watcher: None,
         });
         Ok(state.generation)
+    }
+
+    /// Installs `watcher` as the live watcher for the workspace at
+    /// `expected_generation`, atomically with checking that generation is
+    /// still current. Rejects (and lets the caller tear down `watcher`)
+    /// without touching the session otherwise if a newer `activate` call has
+    /// already superseded `expected_generation` - this is what stops a
+    /// slow-to-`finish` `open_workspace` request from clobbering a faster,
+    /// later request's already-installed watcher.
+    ///
+    /// Because this shares the write lock with `activate`, there is no
+    /// window in which a concurrent `activate` can be observed to succeed
+    /// between this method's generation check and its install.
+    pub fn install_watcher(
+        &self,
+        expected_generation: u64,
+        watcher: RecommendedWatcher,
+    ) -> Result<(), DocumentError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| DocumentError::new("The workspace session is unavailable"))?;
+        if state.generation != expected_generation {
+            return Err(DocumentError::workspace_changed());
+        }
+        let workspace = state
+            .workspace
+            .as_mut()
+            .ok_or_else(|| DocumentError::new("No workspace is currently open"))?;
+        workspace.watcher = Some(watcher);
+        Ok(())
     }
 
     pub fn snapshot(&self, expected_generation: u64) -> Result<WorkspaceSnapshot, DocumentError> {

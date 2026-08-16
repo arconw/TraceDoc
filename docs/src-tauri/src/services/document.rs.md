@@ -10,14 +10,15 @@ Authoritative workspace session, optimistic document I/O, revision history, watc
 - `RECOVERY_DIRECTORY`, `RECOVERY_OWNER_SENTINEL`, `RECOVERY_OWNER_MAGIC` — private recovery namespace ownership contract.
 - `WorkspaceSession` — cloneable `RwLock<SessionState>` owner.
 - `SessionState` — generation counter and optional active workspace.
-- `ActiveWorkspace` — canonical root/project/revision/history/self-write state.
+- `ActiveWorkspace` — canonical root/project/revision/history/self-write state, plus the currently installed native `watcher` (if any). Keeping the watcher inside the same lock-protected struct as `generation`/`root` is what lets `install_watcher` gate installation on the generation atomically, and lets a fresh `activate` (which replaces this struct wholesale) be the only thing that ever retires a previous watcher.
 - `SelfWrite` — internal-save echo suppression token.
 - `WorkspaceLease` — captured root+generation used before blocking work.
 
 ### `WorkspaceSession` methods
 
 - `current_revision(generation)` — returns active revision only for matching generation.
-- `activate(root,project)` — cleans owned crash artifacts, increments generation, installs new active state at revision one.
+- `activate(root,project)` — cleans owned crash artifacts, increments generation, installs new active state at revision one (with no watcher yet). Replacing `SessionState.workspace` here is what drops any previous generation's watcher — and only happens once scanning the new root has already succeeded.
+- `install_watcher(expectedGeneration,watcher)` — installs a native watcher for the active workspace, gated atomically (same write lock as `activate`) on `expectedGeneration` still being current; rejects without touching session state if a newer `activate` already won the race, so a slow, stale `WorkspaceWatcher::finish` can never displace a faster, later request's watcher.
 - `snapshot(expectedGeneration)` — returns the currently active project/revision as a `WorkspaceSnapshot` directly from session state, without rescanning disk.
 - `capture(expectedGeneration)` — returns immutable root/generation lease or workspace-changed error.
 - `read_document(lease,path)` — read-lock validates lease, reads exact content/token, returns current revision.

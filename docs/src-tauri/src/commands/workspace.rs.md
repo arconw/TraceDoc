@@ -2,7 +2,7 @@
 
 Source: `src-tauri/src/commands/workspace.rs`.
 
-- `open_workspace(app,session,watcher,rootPath)` — resolves and arms the native watcher on the canonical root *before* scanning, so changes made during the scan are queued instead of missed; blocking scan, session activation, then folds any changes queued during the scan into the session and starts live delivery, then returns the activated session's snapshot directly (no redundant second full scan).
+- `open_workspace(app,session,watcher,rootPath)` — resolves and arms the native watcher on the canonical root *before* scanning, so changes made during the scan are queued instead of missed; blocking scan, session activation, then folds any changes queued during the scan into the session and starts live delivery, then returns the activated session's snapshot directly (no redundant second full scan). `arm` never touches a previously active workspace's watcher, so a failed scan/activation for a new root leaves an existing workspace's live updates untouched; installing the new watcher (`WorkspaceWatcher::finish` → `WorkspaceSession::install_watcher`) is gated on the activated generation still being current, so a slow, stale `open_workspace` call from an overlapping request can never clobber a faster, later call's watcher — it is torn down instead, and the stale call's own `session.snapshot` reports the loss.
 - `refresh_workspace(session,generation)` — blocking full rescan through the active session with generation/revision checks.
 
 Services: [`workspace scan`](../services/workspace.rs.md), [`document session`](../services/document.rs.md), [`watcher`](../services/watcher.rs.md). Frontend caller: [`projectStore`](../../../src/lib/stores/project.ts.md).

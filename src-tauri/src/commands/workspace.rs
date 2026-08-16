@@ -15,7 +15,7 @@ pub async fn open_workspace<R: tauri::Runtime>(
     root_path: String,
 ) -> Result<WorkspaceSnapshot, String> {
     let session = session.inner().clone();
-    let watcher = watcher.inner().clone();
+    let watcher = *watcher.inner();
     let root_path = PathBuf::from(root_path);
 
     // Resolve the canonical root and arm the native watch on it *before*
@@ -24,7 +24,7 @@ pub async fn open_workspace<R: tauri::Runtime>(
     // buffered changes are folded back in by `finish` below, right after
     // activation, through the same incremental path used for live events -
     // so this closes the race without paying for a second full scan.
-    let scan_watcher = watcher.clone();
+    let scan_watcher = watcher;
     let (armed_watcher, canonical_root, project) =
         tauri::async_runtime::spawn_blocking(move || {
             let canonical_root =
@@ -116,7 +116,7 @@ mod tests {
 
         let app = tauri::test::mock_app();
         app.manage(WorkspaceSession::default());
-        app.manage(WorkspaceWatcher::default());
+        app.manage(WorkspaceWatcher);
         let session_state = app.state::<WorkspaceSession>();
         let watcher_state = app.state::<WorkspaceWatcher>();
         let handle = app.handle().clone();
@@ -140,7 +140,7 @@ mod tests {
 
         let app = tauri::test::mock_app();
         app.manage(WorkspaceSession::default());
-        app.manage(WorkspaceWatcher::default());
+        app.manage(WorkspaceWatcher);
         let session_state = app.state::<WorkspaceSession>();
         let watcher_state = app.state::<WorkspaceWatcher>();
         let handle = app.handle().clone();
