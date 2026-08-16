@@ -1336,7 +1336,7 @@ fn transactional_replace(
             "The document path is not a verified regular file",
         ));
     }
-    let identity = windows_metadata_identity(&metadata)?;
+    let identity = windows_file_identity(&target)?;
     let original = read_file_bytes_portable(&mut target)?;
     if content_token_bytes(&original) != expected_content_token {
         return Err(external_change_error());
@@ -1441,14 +1441,11 @@ fn persist_windows_recovery(
             "The recovery directory is not a verified local directory",
         ));
     }
-    let directory_identity = windows_metadata_identity(&directory_metadata)?;
+    let directory_identity = windows_file_identity(&directory)?;
     ensure_windows_recovery_owner(&directory_path, created)?;
     let transaction_lock_path = directory_path.join(recovery_auxiliary_name(relative_path, "lock"));
     let transaction_lock = acquire_windows_transaction_lock(&directory_path, relative_path)?;
-    let transaction_lock_identity =
-        windows_metadata_identity(&transaction_lock.metadata().map_err(|source| {
-            DocumentError::new(format!("Unable to verify save lock: {source}"))
-        })?)?;
+    let transaction_lock_identity = windows_file_identity(&transaction_lock)?;
     let bytes = encode_recovery_artifact(relative_path, recovery_timestamp()?, content);
     let slot_path = directory_path.join(recovery_slot_name(relative_path));
     match fs::OpenOptions::new()
@@ -1474,7 +1471,7 @@ fn persist_windows_recovery(
                 if decode_recovery_artifact(&existing)
                     .is_some_and(|(path, _, _)| path == relative_path)
                 {
-                    let identity = windows_metadata_identity(&metadata)?;
+                    let identity = windows_file_identity(&existing_file)?;
                     if windows_path_identity(&slot_path)? != identity {
                         return Err(DocumentError::new(
                             "The recovery slot changed during classification",
@@ -1537,10 +1534,7 @@ fn persist_windows_recovery(
     file.write_all(&bytes)
         .and_then(|_| file.sync_all())
         .map_err(|source| DocumentError::new(format!("Unable to persist recovery: {source}")))?;
-    let identity =
-        windows_metadata_identity(&file.metadata().map_err(|source| {
-            DocumentError::new(format!("Unable to verify recovery: {source}"))
-        })?)?;
+    let identity = windows_file_identity(&file)?;
     windows_move_file(&install_path, &slot_path)?;
     install_guard.active = false;
     if !lock_windows_handle(&file) {
@@ -1645,14 +1639,14 @@ fn windows_recovery_matches(artifact: &WindowsRecoveryArtifact) -> bool {
         .directory
         .metadata()
         .ok()
-        .and_then(|metadata| windows_metadata_identity(&metadata).ok())
+        .and_then(|_| windows_file_identity(&artifact.directory).ok())
         == Some(artifact.directory_identity)
         && windows_path_identity(&artifact.directory_path).ok()
             == Some(artifact.directory_identity);
     let data = fs::read(&artifact.slot_path).ok();
     let identity = fs::metadata(&artifact.slot_path)
         .ok()
-        .and_then(|metadata| windows_metadata_identity(&metadata).ok());
+        .and_then(|_| windows_file_identity(&artifact.file).ok());
     directory_matches
         && data.as_deref() == Some(artifact.bytes.as_slice())
         && identity == Some(artifact.identity)
@@ -1712,7 +1706,7 @@ fn acquire_windows_transaction_lock(
     directory: &Path,
     relative_path: &str,
 ) -> Result<fs::File, DocumentError> {
-    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH,
         FILE_SHARE_READ,
@@ -1778,9 +1772,7 @@ impl WindowsInstallGuard {
     fn new(path: PathBuf, file: &fs::File) -> Result<Self, DocumentError> {
         Ok(Self {
             path,
-            identity: windows_metadata_identity(&file.metadata().map_err(|source| {
-                DocumentError::new(format!("Unable to verify recovery install: {source}"))
-            })?)?,
+            identity: windows_file_identity(file)?,
             active: true,
         })
     }
@@ -1821,9 +1813,7 @@ fn recreate_windows_recovery(
     file.write_all(&artifact.bytes)
         .and_then(|_| file.sync_all())
         .map_err(|source| DocumentError::new(format!("Unable to recreate recovery: {source}")))?;
-    let identity = windows_metadata_identity(&file.metadata().map_err(|source| {
-        DocumentError::new(format!("Unable to verify recreated recovery: {source}"))
-    })?)?;
+    let identity = windows_file_identity(&file)?;
     windows_move_file(&install, &path)?;
     install_guard.active = false;
     Ok((path, file, identity))
@@ -1868,7 +1858,7 @@ impl WindowsAncestorGuard {
                     "A document ancestor is not a verified directory",
                 ));
             }
-            let identity = windows_metadata_identity(&metadata)?;
+            let identity = windows_file_identity(&file)?;
             entries.push((current.clone(), file, identity));
         }
         Ok(Self { entries })
@@ -1876,9 +1866,7 @@ impl WindowsAncestorGuard {
 
     fn matches(&self) -> Result<bool, DocumentError> {
         for (path, file, identity) in &self.entries {
-            if windows_metadata_identity(&file.metadata().map_err(|source| {
-                DocumentError::new(format!("Unable to verify document ancestor: {source}"))
-            })?)?
+            if windows_file_identity(file)?
                 != *identity
                 || windows_path_identity(path)? != *identity
             {
@@ -1891,22 +1879,39 @@ impl WindowsAncestorGuard {
 
 #[cfg(windows)]
 fn windows_path_identity(path: &Path) -> Result<(u32, u64), DocumentError> {
-    windows_metadata_identity(&fs::metadata(path).map_err(|source| {
-        DocumentError::new(format!("Unable to verify document path: {source}"))
-    })?)
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
+    };
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|source| DocumentError::new(format!("Unable to verify document path: {source}")))?;
+    windows_file_identity(&file)
 }
 
 #[cfg(windows)]
-fn windows_metadata_identity(metadata: &fs::Metadata) -> Result<(u32, u64), DocumentError> {
-    use std::os::windows::fs::MetadataExt;
+fn windows_file_identity(file: &fs::File) -> Result<(u32, u64), DocumentError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
 
-    let volume = metadata
-        .volume_serial_number()
-        .ok_or_else(|| DocumentError::new("The document volume identity is unavailable"))?;
-    let index = metadata
-        .file_index()
-        .ok_or_else(|| DocumentError::new("The document file identity is unavailable"))?;
-    Ok((volume, index))
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut information) } == 0 {
+        return Err(DocumentError::new(format!(
+            "The document file identity is unavailable: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok((
+        information.dwVolumeSerialNumber,
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    ))
 }
 
 #[cfg(windows)]
