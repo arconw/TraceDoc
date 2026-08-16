@@ -120,9 +120,21 @@ impl WorkspaceWatcher {
     /// mismatch is detected, `armed` is discarded and a fresh watch is
     /// armed on `root` in its place before draining/installing proceeds, so
     /// the watcher that ends up installed tracks the replacement directory
-    /// the session just activated. This is a narrow, low-probability race -
-    /// it requires an external directory swap at the exact canonical path
-    /// during the scan window - not a concern in ordinary single-writer use.
+    /// the session just activated.
+    ///
+    /// A re-arm alone only guarantees that *future* changes to the
+    /// replacement are observed; the `project` already activated for this
+    /// generation was scanned before the re-arm happened and can be stale
+    /// with respect to the replacement's actual contents (the replacement
+    /// directory can itself be swapped again, or edited, in the gap between
+    /// the original scan finishing and the re-arm above). So a successful
+    /// re-arm here also forces a full reconciliation of `root` into the
+    /// session (see `WorkspaceSession::refresh_workspace`) before this
+    /// returns, rather than leaving the activated snapshot to catch up only
+    /// through whatever live events arrive after the re-arm. This is a
+    /// narrow, low-probability race - it requires an external directory
+    /// swap at the exact canonical path during the scan window - not a
+    /// concern in ordinary single-writer use.
     pub fn finish<R: tauri::Runtime>(
         &self,
         armed: ArmedWatcher,
@@ -131,7 +143,7 @@ impl WorkspaceWatcher {
         session: crate::services::document::WorkspaceSession,
         generation: u64,
     ) -> Result<(), String> {
-        let armed = self.revalidate_root_identity(armed, root);
+        let (armed, root_replaced) = self.revalidate_root_identity(armed, root);
         let ArmedWatcher {
             watcher, receiver, ..
         } = armed;
@@ -153,7 +165,21 @@ impl WorkspaceWatcher {
             return Ok(());
         }
 
-        if !pending.is_empty() {
+        if root_replaced {
+            // The root was re-armed onto a replacement directory above, so
+            // the events buffered by the fresh watch only cover the window
+            // after the re-arm. Rescan `root` in full and reconcile that
+            // into the session instead of applying `pending` incrementally,
+            // so the activated snapshot reflects the replacement's actual
+            // current contents rather than whatever the pre-re-arm scan
+            // happened to observe.
+            //
+            // Best-effort: if the workspace already moved on to a newer
+            // generation, or changed again mid-rescan, between the install
+            // above and here, `session.snapshot` (called by the caller
+            // right after this returns) will surface that authoritatively.
+            let _ = session.refresh_workspace(generation);
+        } else if !pending.is_empty() {
             // Best-effort: if the workspace already moved on to a newer
             // generation between the install above and here,
             // `session.snapshot` (called by the caller right after this
@@ -184,23 +210,33 @@ impl WorkspaceWatcher {
         Ok(())
     }
 
-    /// Returns `armed` unchanged unless `root`'s filesystem-object identity
-    /// has diverged from the identity `arm` captured for it, in which case
-    /// `armed` is dropped and a fresh watch is armed on `root` in its place.
-    /// Best-effort: if identity cannot be determined on either side (an
-    /// unsupported platform, or a transient stat failure), no divergence is
-    /// assumed and `armed` is kept as-is, matching pre-revalidation
-    /// behavior. If re-arming fails, `armed` is also kept as-is rather than
-    /// leaving the workspace with no watcher at all.
-    fn revalidate_root_identity(&self, armed: ArmedWatcher, root: &Path) -> ArmedWatcher {
+    /// Returns `armed` unchanged (and reports no replacement) unless `root`'s
+    /// filesystem-object identity has diverged from the identity `arm`
+    /// captured for it, in which case `armed` is dropped and a fresh watch
+    /// is armed on `root` in its place. Best-effort: if identity cannot be
+    /// determined on either side (an unsupported platform, or a transient
+    /// stat failure), no divergence is assumed and `armed` is kept as-is,
+    /// matching pre-revalidation behavior. If re-arming fails, `armed` is
+    /// also kept as-is rather than leaving the workspace with no watcher at
+    /// all - and, since no fresh watch was actually armed, no replacement is
+    /// reported either.
+    ///
+    /// The returned `bool` tells `finish` whether a replacement watch was
+    /// armed, so it knows the already-activated `project` may be stale with
+    /// respect to the replacement directory's current contents and needs a
+    /// full reconciliation rather than an incremental one.
+    fn revalidate_root_identity(&self, armed: ArmedWatcher, root: &Path) -> (ArmedWatcher, bool) {
         let diverged = armed
             .root_identity
             .zip(capture_root_identity(root))
             .is_some_and(|(armed_identity, current_identity)| armed_identity != current_identity);
         if !diverged {
-            return armed;
+            return (armed, false);
         }
-        self.arm(root).unwrap_or(armed)
+        match self.arm(root) {
+            Ok(fresh) => (fresh, true),
+            Err(_) => (armed, false),
+        }
     }
 }
 
@@ -1684,6 +1720,82 @@ mod tests {
             "the watcher must track the replacement directory living at root's path, \
              not the renamed-away original it was armed on"
         );
+
+        let _ = fs::remove_dir_all(&displaced);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finish_reconciles_the_replacement_directory_when_it_changes_again_before_the_re_arm() {
+        use crate::services::document::WorkspaceSession;
+
+        // Same narrow edge case as the sibling test above, but the
+        // replacement directory is mutated again *after* the pre-activation
+        // scan already read it and *before* `finish`'s re-arm runs. A
+        // re-arm alone only starts observing changes from the moment it
+        // runs forward - it cannot retroactively see a change that already
+        // happened before it - so without reconciling the replacement's
+        // actual current contents after re-arming, this change would be
+        // lost until a manual refresh.
+        let workspace = TestWorkspace::new();
+        let root = workspace.path().to_path_buf();
+        fs::write(root.join("old.md"), "# Old").expect("original file should be written");
+
+        let watcher = super::WorkspaceWatcher;
+        let armed = watcher
+            .arm(&root)
+            .expect("watcher should arm on the original directory");
+
+        let displaced = root.with_file_name(format!(
+            "{}-displaced",
+            root.file_name()
+                .expect("fixture root should have a name")
+                .to_string_lossy()
+        ));
+        fs::rename(&root, &displaced).expect("the original directory should be renamed away");
+        fs::create_dir_all(&root)
+            .expect("a replacement directory should be created at the same path");
+        fs::write(root.join("new.md"), "# New").expect("the replacement file should be written");
+
+        // This scan stands in for the scan that runs between `arm` and
+        // `activate` in production; it reads the replacement directory as
+        // it stands right now, before it changes again below.
+        let project = scan_workspace(&root).expect("scan should read the replacement directory");
+        assert!(project.documents.contains_key("document:new.md"));
+        assert!(!project
+            .documents
+            .contains_key("document:added-after-scan.md"));
+
+        let session = WorkspaceSession::default();
+        let generation = session
+            .activate(root.clone(), project)
+            .expect("workspace should activate");
+
+        // The replacement directory changes again after the scan above
+        // already produced the activated `project`, but before `finish`
+        // (and the re-arm inside it) runs.
+        fs::write(root.join("added-after-scan.md"), "# Added after scan")
+            .expect("a file added after the scan but before finish should be written");
+
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        watcher
+            .finish(armed, &root, handle, session.clone(), generation)
+            .expect("finish should re-arm and reconcile the replacement directory");
+
+        let snapshot = session
+            .snapshot(generation)
+            .expect("the activated snapshot should be readable");
+        assert!(
+            snapshot
+                .project
+                .documents
+                .contains_key("document:added-after-scan.md"),
+            "a change made to the replacement directory between the scan and finish's \
+             re-arm must be reconciled by finish, not left stale until a manual refresh"
+        );
+        assert!(snapshot.project.documents.contains_key("document:new.md"));
+        assert!(!snapshot.project.documents.contains_key("document:old.md"));
 
         let _ = fs::remove_dir_all(&displaced);
     }
