@@ -7,6 +7,14 @@
   import WorkspaceView from './lib/views/WorkspaceView.svelte';
 
   let appName = 'Simple Docs';
+  let workspaceView: WorkspaceView | undefined;
+
+  async function openFolder() {
+    const canOpen = await workspaceView?.prepareWorkspaceChange();
+    if (canOpen === false) return;
+
+    await projectStore.openFolder();
+  }
 
   onMount(async () => {
     try {
@@ -25,13 +33,14 @@
     <button
       type="button"
       disabled={$projectStore.status === 'loading'}
-      onclick={() => projectStore.openFolder()}
+      onclick={openFolder}
     >
       {$projectStore.status === 'loading' ? 'Opening…' : 'Open Folder'}
     </button>
   </header>
   {#if $projectStore.status === 'loaded'}
     <WorkspaceView
+      bind:this={workspaceView}
       project={$projectStore.project}
       selectedDocumentId={$projectStore.selectedDocumentId}
     />
