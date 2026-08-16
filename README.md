@@ -1,6 +1,6 @@
 # TraceDoc
 
-TraceDoc is a local-first desktop documentation tool. Milestone 01 provides the minimal Tauri and Svelte application shell.
+TraceDoc is a local-first desktop documentation tool. It opens a local folder and builds a Markdown-oriented project model from its directory structure.
 
 ## Development
 

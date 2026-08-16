@@ -16,7 +16,8 @@
     "tauri": "tauri"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.0.0"
+    "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-dialog": "^2.7.2"
   },
   "devDependencies": {
     "@eslint/js": "^9.0.0",

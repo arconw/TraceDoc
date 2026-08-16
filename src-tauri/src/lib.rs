@@ -4,7 +4,11 @@ pub mod services;
 
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![commands::app::get_app_info])
+        .plugin(tauri_plugin_dialog::init())
+        .invoke_handler(tauri::generate_handler![
+            commands::app::get_app_info,
+            commands::workspace::open_workspace
+        ])
         .run(tauri::generate_context!())
         .expect("error while running TraceDoc");
 }
