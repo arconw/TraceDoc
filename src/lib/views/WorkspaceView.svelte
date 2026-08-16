@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, tick } from 'svelte';
+  import LinkInspector from '../components/LinkInspector.svelte';
   import MarkdownEditor from '../components/MarkdownEditor.svelte';
   import Sidebar from '../components/Sidebar.svelte';
   import { projectStore } from '../stores/project';
@@ -9,6 +10,7 @@
     { kind: 'document'; documentId: DocumentId } | { kind: 'workspace' };
 
   export let project: ProjectModel;
+  export let workspaceGeneration: number;
   export let selectedDocumentId: DocumentId | null;
 
   let editor: MarkdownEditor | undefined;
@@ -134,7 +136,14 @@
 
 <div class="workspace">
   <Sidebar {project} {selectedDocumentId} onSelectDocument={requestDocument} />
-  <MarkdownEditor bind:this={editor} document={selectedDocument} />
+  <div class="workspace__content">
+    <MarkdownEditor
+      bind:this={editor}
+      document={selectedDocument}
+      {workspaceGeneration}
+    />
+    <LinkInspector {project} {selectedDocumentId} />
+  </div>
 </div>
 
 <dialog
@@ -186,6 +195,13 @@
     min-width: 0;
     min-height: 0;
     grid-template-columns: clamp(13rem, 25vw, 18rem) minmax(0, 1fr);
+  }
+
+  .workspace__content {
+    display: grid;
+    min-width: 0;
+    min-height: 0;
+    grid-template-rows: minmax(0, 1fr) 10.5rem;
   }
 
   .switch-dialog {

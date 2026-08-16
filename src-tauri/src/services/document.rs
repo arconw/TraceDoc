@@ -1,31 +1,134 @@
-use crate::services::workspace::{normalize_relative_path, scan_workspace, WorkspaceError};
+use crate::{
+    models::workspace::{DocumentIndexUpdate, DocumentReadResult, ProjectModel},
+    services::{
+        markdown::refresh_document_index,
+        workspace::{normalize_relative_path, scan_workspace, WorkspaceError},
+    },
+};
 use std::{
     fmt, fs,
     path::{Path, PathBuf},
-    sync::RwLock,
+    sync::{Arc, RwLock},
 };
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct WorkspaceSession {
-    root: RwLock<Option<PathBuf>>,
+    state: Arc<RwLock<SessionState>>,
+}
+
+#[derive(Default)]
+struct SessionState {
+    generation: u64,
+    workspace: Option<ActiveWorkspace>,
+}
+
+struct ActiveWorkspace {
+    root: PathBuf,
+    project: ProjectModel,
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkspaceLease {
+    generation: u64,
+    root: PathBuf,
 }
 
 impl WorkspaceSession {
-    pub fn activate(&self, root: PathBuf) -> Result<(), DocumentError> {
-        let mut active_root = self
-            .root
+    pub fn activate(&self, root: PathBuf, project: ProjectModel) -> Result<u64, DocumentError> {
+        let mut state = self
+            .state
             .write()
             .map_err(|_| DocumentError::new("The workspace session is unavailable"))?;
-        *active_root = Some(root);
-        Ok(())
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| DocumentError::new("The workspace generation is unavailable"))?;
+        state.workspace = Some(ActiveWorkspace { root, project });
+        Ok(state.generation)
     }
 
-    pub fn root(&self) -> Result<PathBuf, DocumentError> {
-        self.root
+    pub fn capture(&self, expected_generation: u64) -> Result<WorkspaceLease, DocumentError> {
+        let state = self
+            .state
             .read()
-            .map_err(|_| DocumentError::new("The workspace session is unavailable"))?
-            .clone()
-            .ok_or_else(|| DocumentError::new("No workspace is currently open"))
+            .map_err(|_| DocumentError::new("The workspace session is unavailable"))?;
+        let workspace = state
+            .workspace
+            .as_ref()
+            .ok_or_else(|| DocumentError::new("No workspace is currently open"))?;
+
+        if state.generation != expected_generation {
+            return Err(DocumentError::workspace_changed());
+        }
+
+        Ok(WorkspaceLease {
+            generation: state.generation,
+            root: workspace.root.clone(),
+        })
+    }
+
+    pub fn read_document(
+        &self,
+        lease: &WorkspaceLease,
+        document_path: &str,
+    ) -> Result<DocumentReadResult, DocumentError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| DocumentError::new("The workspace session is unavailable"))?;
+        let workspace = state
+            .workspace
+            .as_ref()
+            .ok_or_else(|| DocumentError::new("No workspace is currently open"))?;
+
+        validate_workspace(&state, workspace, lease)?;
+        let content = read_document(&lease.root, document_path)?;
+        Ok(DocumentReadResult {
+            workspace_generation: lease.generation,
+            content,
+        })
+    }
+
+    pub fn save_document(
+        &self,
+        lease: &WorkspaceLease,
+        document_path: &str,
+        content: &str,
+    ) -> Result<DocumentIndexUpdate, DocumentError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| DocumentError::new("The workspace session is unavailable"))?;
+        let generation = state.generation;
+        let workspace = state
+            .workspace
+            .as_mut()
+            .ok_or_else(|| DocumentError::new("No workspace is currently open"))?;
+
+        if generation != lease.generation || workspace.root != lease.root {
+            return Err(DocumentError::workspace_changed());
+        }
+
+        write_document(&lease.root, document_path, content)?;
+        refresh_document_index(
+            &mut workspace.project,
+            document_path,
+            content,
+            lease.generation,
+        )
+        .map_err(DocumentError::new)
+    }
+}
+
+fn validate_workspace(
+    state: &SessionState,
+    workspace: &ActiveWorkspace,
+    lease: &WorkspaceLease,
+) -> Result<(), DocumentError> {
+    if state.generation == lease.generation && workspace.root == lease.root {
+        Ok(())
+    } else {
+        Err(DocumentError::workspace_changed())
     }
 }
 
@@ -35,6 +138,10 @@ pub struct DocumentError(String);
 impl DocumentError {
     fn new(message: impl Into<String>) -> Self {
         Self(message.into())
+    }
+
+    fn workspace_changed() -> Self {
+        Self::new("The workspace changed before the document request could complete")
     }
 }
 
@@ -152,11 +259,17 @@ fn preserve_line_endings(existing_content: &str, content: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{has_forbidden_backslash, open_workspace, read_document, write_document};
+    use super::{
+        has_forbidden_backslash, open_workspace, read_document, write_document, WorkspaceSession,
+    };
     use std::{
         fs,
         path::{Path, PathBuf},
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc, Barrier,
+        },
+        thread,
     };
 
     static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
@@ -262,6 +375,125 @@ mod tests {
             fs::read_to_string(path).expect("LF document should be readable"),
             "# Heading\n\nChanged\n"
         );
+    }
+
+    #[test]
+    fn saves_and_reindexes_only_the_active_document() {
+        let workspace = TestDirectory::new("save-and-index");
+        fs::write(workspace.path().join("page.md"), "# Original").expect("page should be written");
+        fs::write(workspace.path().join("target.md"), "# Target")
+            .expect("target should be written");
+        let (project, root) = open_workspace(workspace.path()).expect("workspace should open");
+        let session = WorkspaceSession::default();
+        let generation = session
+            .activate(root, project)
+            .expect("workspace session should activate");
+        let lease = session
+            .capture(generation)
+            .expect("workspace lease should be captured");
+        let read = session
+            .read_document(&lease, "page.md")
+            .expect("document should read through its workspace lease");
+
+        let update = session
+            .save_document(&lease, "page.md", "# Changed\n\n[[target]]")
+            .expect("document should save and reindex");
+
+        assert_eq!(read.workspace_generation, generation);
+        assert_eq!(read.content, "# Original");
+        assert_eq!(update.workspace_generation, generation);
+        assert_eq!(update.document.title.as_deref(), Some("Changed"));
+        assert_eq!(update.links.len(), 1);
+        assert_eq!(
+            update.links[0].target_document_id.as_deref(),
+            Some("document:target.md")
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("page.md"))
+                .expect("saved document should be readable"),
+            "# Changed\n\n[[target]]"
+        );
+    }
+
+    #[test]
+    fn rejects_a_pending_save_after_the_workspace_changes() {
+        let first = TestDirectory::new("pending-save-first");
+        let second = TestDirectory::new("pending-save-second");
+        fs::write(first.path().join("page.md"), "# First").expect("first page should be written");
+        fs::write(second.path().join("page.md"), "# Second")
+            .expect("second page should be written");
+        let (first_project, first_root) =
+            open_workspace(first.path()).expect("first workspace should open");
+        let (second_project, second_root) =
+            open_workspace(second.path()).expect("second workspace should open");
+        let session = WorkspaceSession::default();
+        let first_generation = session
+            .activate(first_root, first_project)
+            .expect("first workspace should activate");
+        let lease = session
+            .capture(first_generation)
+            .expect("first workspace lease should be captured");
+        let barrier = Arc::new(Barrier::new(2));
+        let pending_session = session.clone();
+        let pending_barrier = barrier.clone();
+        let pending_save = thread::spawn(move || {
+            pending_barrier.wait();
+            pending_session.save_document(&lease, "page.md", "# Stale")
+        });
+
+        session
+            .activate(second_root, second_project)
+            .expect("second workspace should activate");
+        barrier.wait();
+        let error = pending_save
+            .join()
+            .expect("pending save thread should finish")
+            .expect_err("stale save should fail");
+
+        assert!(error.to_string().contains("workspace changed"));
+        assert_eq!(
+            fs::read_to_string(first.path().join("page.md"))
+                .expect("first page should remain readable"),
+            "# First"
+        );
+        assert_eq!(
+            fs::read_to_string(second.path().join("page.md"))
+                .expect("second page should remain readable"),
+            "# Second"
+        );
+    }
+
+    #[test]
+    fn rejects_pending_reads_and_late_capture_after_the_workspace_changes() {
+        let first = TestDirectory::new("pending-read-first");
+        let second = TestDirectory::new("pending-read-second");
+        fs::write(first.path().join("page.md"), "# First").expect("first page should be written");
+        fs::write(second.path().join("page.md"), "# Second")
+            .expect("second page should be written");
+        let (first_project, first_root) =
+            open_workspace(first.path()).expect("first workspace should open");
+        let (second_project, second_root) =
+            open_workspace(second.path()).expect("second workspace should open");
+        let session = WorkspaceSession::default();
+        let first_generation = session
+            .activate(first_root, first_project)
+            .expect("first workspace should activate");
+        let lease = session
+            .capture(first_generation)
+            .expect("first workspace lease should be captured");
+
+        session
+            .activate(second_root, second_project)
+            .expect("second workspace should activate");
+
+        let read_error = session
+            .read_document(&lease, "page.md")
+            .expect_err("stale read should fail");
+        let capture_error = session
+            .capture(first_generation)
+            .expect_err("late stale capture should fail");
+        assert!(read_error.to_string().contains("workspace changed"));
+        assert!(capture_error.to_string().contains("workspace changed"));
     }
 
     #[cfg(unix)]

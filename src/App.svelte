@@ -42,6 +42,7 @@
     <WorkspaceView
       bind:this={workspaceView}
       project={$projectStore.project}
+      workspaceGeneration={$projectStore.workspaceGeneration}
       selectedDocumentId={$projectStore.selectedDocumentId}
     />
   {:else}

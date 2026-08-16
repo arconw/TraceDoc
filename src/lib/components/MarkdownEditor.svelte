@@ -28,22 +28,34 @@
     rectangularSelection,
   } from '@codemirror/view';
   import { onMount } from 'svelte';
-  import type { Document as WorkspaceDocument } from '../types/workspace';
+  import { projectStore } from '../stores/project';
+  import type {
+    Document as WorkspaceDocument,
+    DocumentIndexUpdate,
+    DocumentReadResult,
+  } from '../types/workspace';
 
   export let document: WorkspaceDocument | null;
+  export let workspaceGeneration: number;
 
   let editorHost: HTMLDivElement;
   let editorView: EditorView | null = null;
   let activeDocument: WorkspaceDocument | null = null;
   let requestedDocumentId: string | null | undefined = undefined;
+  let requestedWorkspaceGeneration: number | undefined = undefined;
   let savedContent = '';
   let dirty = false;
   let requestVersion = 0;
   let status: 'empty' | 'loading' | 'ready' | 'saving' | 'error' = 'empty';
   let message: string | null = null;
 
-  $: if (editorView && (document?.id ?? null) !== requestedDocumentId) {
+  $: if (
+    editorView &&
+    ((document?.id ?? null) !== requestedDocumentId ||
+      workspaceGeneration !== requestedWorkspaceGeneration)
+  ) {
     requestedDocumentId = document?.id ?? null;
+    requestedWorkspaceGeneration = workspaceGeneration;
     void loadDocument(document);
   }
 
@@ -119,13 +131,25 @@
     const documentId = activeDocument.id;
     const documentPath = activeDocument.path;
     const content = editorView.state.sliceDoc();
+    const requestGeneration = workspaceGeneration;
     status = 'saving';
     message = null;
 
     try {
-      await invoke('write_document', { documentPath, content });
+      const indexUpdate = await invoke<DocumentIndexUpdate>('write_document', {
+        documentPath,
+        content,
+        workspaceGeneration: requestGeneration,
+      });
 
-      if (activeDocument?.id !== documentId || !editorView) return false;
+      projectStore.applyDocumentIndex(indexUpdate);
+      if (
+        activeDocument?.id !== documentId ||
+        requestGeneration !== workspaceGeneration ||
+        !editorView
+      ) {
+        return true;
+      }
       savedContent = content;
       dirty = editorView.state.sliceDoc() !== savedContent;
       status = 'ready';
@@ -191,6 +215,7 @@
 
   async function loadDocument(target: WorkspaceDocument | null) {
     const version = ++requestVersion;
+    const requestGeneration = workspaceGeneration;
     activeDocument = null;
     savedContent = '';
     dirty = false;
@@ -206,16 +231,24 @@
     editorView?.setState(createEditorState('', false));
 
     try {
-      const content = await invoke<string>('read_document', {
+      const result = await invoke<DocumentReadResult>('read_document', {
         documentPath: target.path,
+        workspaceGeneration: requestGeneration,
       });
 
-      if (version !== requestVersion || !editorView) return;
+      if (
+        version !== requestVersion ||
+        result.workspaceGeneration !== requestGeneration ||
+        requestGeneration !== workspaceGeneration ||
+        !editorView
+      ) {
+        return;
+      }
       activeDocument = target;
-      savedContent = content;
+      savedContent = result.content;
       dirty = false;
       status = 'ready';
-      editorView.setState(createEditorState(content, true));
+      editorView.setState(createEditorState(result.content, true));
       editorView.focus();
     } catch (error) {
       if (version !== requestVersion) return;

@@ -1,4 +1,5 @@
 use crate::models::workspace::{Document, DocumentId, Folder, FolderId, ProjectModel};
+use crate::services::markdown::{filename_title, index_workspace_documents};
 use std::{
     collections::BTreeMap,
     ffi::OsStr,
@@ -87,12 +88,14 @@ pub fn scan_workspace(root: &Path) -> Result<ProjectModel, WorkspaceError> {
 
     scanner.scan_directory(&root, &root_id, true)?;
 
-    Ok(ProjectModel {
+    let mut project = ProjectModel {
         root_path,
         folders: scanner.folders,
         documents: scanner.documents,
         links: Vec::new(),
-    })
+    };
+    index_workspace_documents(&root, &mut project);
+    Ok(project)
 }
 
 struct WorkspaceScanner {
@@ -168,12 +171,14 @@ impl WorkspaceScanner {
                 self.scan_directory(&entry_path, &id, false)?;
             } else if file_type.is_file() && is_markdown_file(&entry_path) {
                 let id = document_id(&relative_path);
+                let title = filename_title(&name);
                 self.documents.insert(
                     id.clone(),
                     Document {
                         id: id.clone(),
                         name,
-                        title: None,
+                        title,
+                        headings: Vec::new(),
                         path: relative_path,
                         parent_id: parent_id.to_owned(),
                     },
@@ -400,6 +405,48 @@ mod tests {
             backend.document_ids,
             ["document:backend/api.md", "document:backend/auth.MD"]
         );
+    }
+
+    #[test]
+    fn indexes_document_titles_headings_and_nested_links_during_scan() {
+        let workspace = TestWorkspace::new();
+        fs::create_dir_all(workspace.path().join("frontend"))
+            .expect("frontend folder should be created");
+        fs::create_dir_all(workspace.path().join("backend"))
+            .expect("backend folder should be created");
+        fs::write(
+            workspace.path().join("frontend/app.md"),
+            "# App\n\n## Dependencies\n\nUses [API](../backend/api.md).",
+        )
+        .expect("app should be written");
+        fs::write(workspace.path().join("backend/api.md"), "# API").expect("api should be written");
+
+        let project = scan_workspace(workspace.path()).expect("workspace should scan");
+        let app = &project.documents["document:frontend/app.md"];
+
+        assert_eq!(app.title.as_deref(), Some("App"));
+        assert_eq!(app.headings.len(), 2);
+        assert_eq!(app.headings[1].text, "Dependencies");
+        assert_eq!(project.links.len(), 1);
+        assert_eq!(
+            project.links[0].target_document_id.as_deref(),
+            Some("document:backend/api.md")
+        );
+        assert!(project.links[0].resolved);
+    }
+
+    #[test]
+    fn keeps_invalid_utf8_markdown_in_the_tree_with_a_filename_title() {
+        let workspace = TestWorkspace::new();
+        fs::write(workspace.path().join("binary.md"), [0xff, 0xfe, 0xfd])
+            .expect("invalid UTF-8 document should be written");
+
+        let project = scan_workspace(workspace.path()).expect("workspace should scan");
+        let document = &project.documents["document:binary.md"];
+
+        assert_eq!(document.title.as_deref(), Some("binary"));
+        assert!(document.headings.is_empty());
+        assert!(project.links.is_empty());
     }
 
     #[test]
