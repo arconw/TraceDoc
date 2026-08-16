@@ -28,6 +28,11 @@
     rectangularSelection,
   } from '@codemirror/view';
   import { onMount } from 'svelte';
+  import {
+    closesDeletedBufferWithoutDiskAccess,
+    editorReadIsCurrent,
+    retainedLocalBaseline,
+  } from '../editor/request-state';
   import { projectStore } from '../stores/project';
   import type {
     Document as WorkspaceDocument,
@@ -36,35 +41,54 @@
   } from '../types/workspace';
 
   export let document: WorkspaceDocument | null;
+  export let selectedDocumentId: string | null;
+  export let externalChangeVersion: number;
   export let workspaceGeneration: number;
+  export let workspaceRevision: number;
 
   let editorHost: HTMLDivElement;
   let editorView: EditorView | null = null;
   let activeDocument: WorkspaceDocument | null = null;
   let requestedDocumentId: string | null | undefined = undefined;
   let requestedWorkspaceGeneration: number | undefined = undefined;
+  let handledExternalChangeVersion = 0;
   let savedContent = '';
+  let savedContentToken = '';
   let dirty = false;
   let requestVersion = 0;
   let status: 'empty' | 'loading' | 'ready' | 'saving' | 'error' = 'empty';
   let message: string | null = null;
+  let saveWarning: string | null = null;
+  let conflict: 'modified' | 'deleted' | null = null;
 
   $: if (
     editorView &&
-    ((document?.id ?? null) !== requestedDocumentId ||
+    (selectedDocumentId !== requestedDocumentId ||
       workspaceGeneration !== requestedWorkspaceGeneration)
   ) {
-    requestedDocumentId = document?.id ?? null;
+    requestedDocumentId = selectedDocumentId;
     requestedWorkspaceGeneration = workspaceGeneration;
-    void loadDocument(document);
+    handledExternalChangeVersion = externalChangeVersion;
+    void loadDocument(document, selectedDocumentId);
+  }
+
+  $: if (
+    editorView &&
+    externalChangeVersion !== handledExternalChangeVersion &&
+    selectedDocumentId === requestedDocumentId
+  ) {
+    handledExternalChangeVersion = externalChangeVersion;
+    void handleExternalChange();
   }
 
   $: statusLabel = (() => {
+    if (conflict) return 'External conflict';
     if (status === 'loading') return 'Loading…';
     if (status === 'saving') return 'Saving…';
     if (status === 'error') return 'Load failed';
     if (message) return 'Save failed';
-    if (dirty) return 'Unsaved';
+    if (saveWarning) return 'Saved with warning';
+    if (dirty) return 'Modified';
     return activeDocument ? 'Saved' : '';
   })();
 
@@ -120,6 +144,11 @@
       return false;
     }
 
+    if (conflict) {
+      message = 'Resolve the external change before saving.';
+      return false;
+    }
+
     if (status !== 'ready') {
       message =
         status === 'saving'
@@ -132,16 +161,28 @@
     const documentPath = activeDocument.path;
     const content = editorView.state.sliceDoc();
     const requestGeneration = workspaceGeneration;
+    const requestRevision = workspaceRevision;
     status = 'saving';
     message = null;
+    saveWarning = null;
 
     try {
       const indexUpdate = await invoke<DocumentIndexUpdate>('write_document', {
         documentPath,
         content,
+        expectedContentToken: savedContentToken,
+        expectedWorkspaceRevision: requestRevision,
         workspaceGeneration: requestGeneration,
       });
 
+      if (
+        indexUpdate.workspaceRevision <= requestRevision ||
+        indexUpdate.workspaceRevision < workspaceRevision
+      ) {
+        conflict = 'modified';
+        status = 'ready';
+        return false;
+      }
       projectStore.applyDocumentIndex(indexUpdate);
       if (
         activeDocument?.id !== documentId ||
@@ -151,12 +192,20 @@
         return true;
       }
       savedContent = content;
+      savedContentToken = indexUpdate.contentToken;
       dirty = editorView.state.sliceDoc() !== savedContent;
+      saveWarning = indexUpdate.saveWarning;
       status = 'ready';
       return true;
     } catch (error) {
       if (activeDocument?.id === documentId) {
-        message = errorMessage(error);
+        const nextMessage = errorMessage(error);
+        if (nextMessage.includes('changed externally')) {
+          conflict = 'modified';
+          message = null;
+        } else {
+          message = nextMessage;
+        }
         status = 'ready';
       }
       return false;
@@ -194,6 +243,7 @@
           if (!update.docChanged || !activeDocument) return;
           dirty = update.state.sliceDoc() !== savedContent;
           message = null;
+          saveWarning = null;
         }),
         keymap.of([
           {
@@ -213,13 +263,33 @@
     });
   }
 
-  async function loadDocument(target: WorkspaceDocument | null) {
+  async function loadDocument(
+    target: WorkspaceDocument | null,
+    targetId: string | null,
+    discardLocal = false,
+  ) {
+    if (
+      !discardLocal &&
+      !target &&
+      targetId &&
+      activeDocument?.id === targetId &&
+      dirty
+    ) {
+      conflict = 'deleted';
+      message = null;
+      saveWarning = null;
+      status = 'ready';
+      return;
+    }
     const version = ++requestVersion;
     const requestGeneration = workspaceGeneration;
     activeDocument = null;
     savedContent = '';
+    savedContentToken = '';
     dirty = false;
     message = null;
+    saveWarning = null;
+    conflict = null;
 
     if (!target) {
       status = 'empty';
@@ -237,15 +307,24 @@
       });
 
       if (
-        version !== requestVersion ||
-        result.workspaceGeneration !== requestGeneration ||
-        requestGeneration !== workspaceGeneration ||
+        !editorReadIsCurrent(
+          {
+            version,
+            documentId: target.id,
+            workspaceGeneration: requestGeneration,
+          },
+          requestVersion,
+          selectedDocumentId,
+          workspaceGeneration,
+          result.workspaceGeneration,
+        ) ||
         !editorView
       ) {
         return;
       }
       activeDocument = target;
       savedContent = result.content;
+      savedContentToken = result.contentToken;
       dirty = false;
       status = 'ready';
       editorView.setState(createEditorState(result.content, true));
@@ -258,7 +337,131 @@
   }
 
   function retryLoad() {
-    if (document) void loadDocument(document);
+    if (document) void loadDocument(document, selectedDocumentId);
+  }
+
+  function handleExternalChange() {
+    if (!selectedDocumentId) return;
+    requestVersion += 1;
+    if (!activeDocument || activeDocument.id !== selectedDocumentId) {
+      return loadDocument(document, selectedDocumentId);
+    }
+    if (dirty || status === 'saving') {
+      conflict = document ? 'modified' : 'deleted';
+      message = null;
+      saveWarning = null;
+      status = 'ready';
+      return;
+    }
+    return loadDocument(document, selectedDocumentId);
+  }
+
+  async function keepLocalChanges() {
+    if (conflict !== 'modified' || !activeDocument || status !== 'ready') {
+      return;
+    }
+    const version = ++requestVersion;
+    const documentId = activeDocument.id;
+    const documentPath = activeDocument.path;
+    const requestGeneration = workspaceGeneration;
+    status = 'loading';
+    try {
+      await invoke('acknowledge_save_conflict', {
+        documentPath,
+        workspaceGeneration: requestGeneration,
+      });
+      const result = await invoke<DocumentReadResult>('read_document', {
+        documentPath,
+        workspaceGeneration: requestGeneration,
+      });
+      if (
+        !editorReadIsCurrent(
+          { version, documentId, workspaceGeneration: requestGeneration },
+          requestVersion,
+          selectedDocumentId,
+          workspaceGeneration,
+          result.workspaceGeneration,
+        ) ||
+        activeDocument?.id !== documentId ||
+        !editorView
+      ) {
+        return;
+      }
+      const retained = retainedLocalBaseline(
+        editorView.state.sliceDoc(),
+        result.content,
+        result.contentToken,
+      );
+      savedContent = retained.savedContent;
+      savedContentToken = retained.savedContentToken;
+      dirty = retained.dirty;
+      conflict = null;
+      status = 'ready';
+    } catch (error) {
+      if (
+        !editorReadIsCurrent(
+          { version, documentId, workspaceGeneration: requestGeneration },
+          requestVersion,
+          selectedDocumentId,
+          workspaceGeneration,
+          requestGeneration,
+        ) ||
+        activeDocument?.id !== documentId
+      ) {
+        return;
+      }
+      message = errorMessage(error);
+      status = 'ready';
+    }
+  }
+
+  async function reloadExternal() {
+    if (!activeDocument || status !== 'ready') return;
+    const version = ++requestVersion;
+    const documentId = activeDocument.id;
+    const documentPath = activeDocument.path;
+    const requestGeneration = workspaceGeneration;
+    if (closesDeletedBufferWithoutDiskAccess(conflict)) {
+      activeDocument = null;
+      requestedDocumentId = null;
+      savedContent = '';
+      savedContentToken = '';
+      dirty = false;
+      conflict = null;
+      message = null;
+      saveWarning = null;
+      status = 'empty';
+      editorView?.setState(createEditorState('', false));
+      projectStore.closeDocument(documentId);
+      return;
+    }
+    status = 'loading';
+    try {
+      await invoke('acknowledge_save_conflict', {
+        documentPath,
+        workspaceGeneration: requestGeneration,
+      });
+      if (
+        version !== requestVersion ||
+        selectedDocumentId !== documentId ||
+        workspaceGeneration !== requestGeneration
+      ) {
+        return;
+      }
+      dirty = false;
+      conflict = null;
+      await loadDocument(document, selectedDocumentId, true);
+    } catch (error) {
+      if (
+        version !== requestVersion ||
+        selectedDocumentId !== documentId ||
+        workspaceGeneration !== requestGeneration
+      ) {
+        return;
+      }
+      message = errorMessage(error);
+      status = 'ready';
+    }
   }
 
   function errorMessage(error: unknown) {
@@ -270,11 +473,17 @@
   }
 </script>
 
-<section class="editor-pane" aria-label="Document editor">
-  {#if document}
+<section
+  class:has-conflict={Boolean(conflict)}
+  class:has-warning={Boolean(saveWarning)}
+  class="editor-pane"
+  aria-label="Document editor"
+>
+  {#if document || activeDocument}
     <header class="editor-header">
       <div class="editor-title">
-        <span class="editor-name">{document.name}</span>
+        <span class="editor-name">{document?.name ?? activeDocument?.name}</span
+        >
         {#if dirty}
           <span
             class="dirty-indicator"
@@ -284,8 +493,9 @@
         {/if}
         <span
           class:error={Boolean(message)}
+          class:warning={Boolean(saveWarning)}
           class="editor-status"
-          title={message ?? undefined}
+          title={message ?? saveWarning ?? undefined}
         >
           {statusLabel}
         </span>
@@ -293,19 +503,41 @@
       <button
         type="button"
         class="save-button"
-        disabled={!dirty || status !== 'ready'}
+        disabled={!dirty || status !== 'ready' || Boolean(conflict)}
         title="Save document (Ctrl/Cmd+S)"
         onclick={() => save()}
       >
         Save
       </button>
     </header>
+    {#if saveWarning}
+      <div class="save-warning" role="status" aria-live="polite">
+        {saveWarning}
+      </div>
+    {/if}
+    {#if conflict}
+      <div class="conflict-banner" role="alert">
+        <span>
+          {conflict === 'deleted'
+            ? 'This file was deleted externally. Your unsaved buffer is still open.'
+            : 'This file changed externally. Your unsaved buffer was not overwritten.'}
+        </span>
+        <div>
+          {#if conflict === 'modified'}
+            <button type="button" onclick={keepLocalChanges}>Keep mine</button>
+          {/if}
+          <button type="button" onclick={reloadExternal}>
+            {conflict === 'deleted' ? 'Close buffer' : 'Reload file'}
+          </button>
+        </div>
+      </div>
+    {/if}
   {/if}
 
   <div class="editor-body">
     <div class="editor-host" bind:this={editorHost}></div>
 
-    {#if !document}
+    {#if !document && !activeDocument}
       <div class="editor-empty">
         <svg viewBox="0 0 24 24" aria-hidden="true">
           <path d="M6 3.5h8l4 4v13H6z" />
@@ -335,6 +567,59 @@
     min-height: 0;
     grid-template-rows: auto minmax(0, 1fr);
     background: var(--color-background);
+  }
+
+  .editor-pane.has-conflict {
+    grid-template-rows: auto auto minmax(0, 1fr);
+  }
+
+  .editor-pane.has-warning {
+    grid-template-rows: auto auto minmax(0, 1fr);
+  }
+
+  .editor-pane.has-warning.has-conflict {
+    grid-template-rows: auto auto auto minmax(0, 1fr);
+  }
+
+  .save-warning {
+    padding: var(--space-2) var(--space-4);
+    border-bottom: 1px solid color-mix(in srgb, #a66a00 40%, transparent);
+    background: color-mix(in srgb, #a66a00 9%, var(--color-surface));
+    color: var(--color-foreground-subtle);
+    font-size: 0.75rem;
+  }
+
+  .conflict-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    padding: var(--space-2) var(--space-4);
+    border-bottom: 1px solid
+      color-mix(in srgb, var(--color-error) 45%, transparent);
+    background: color-mix(
+      in srgb,
+      var(--color-error) 10%,
+      var(--color-surface)
+    );
+    color: var(--color-foreground-subtle);
+    font-size: 0.75rem;
+  }
+
+  .conflict-banner div {
+    display: flex;
+    flex: none;
+    gap: var(--space-2);
+  }
+
+  .conflict-banner button {
+    padding: 0.25rem var(--space-2);
+    border: 1px solid var(--color-border-strong);
+    border-radius: var(--radius-sm);
+    background: var(--color-surface-raised);
+    color: var(--color-foreground);
+    cursor: pointer;
+    font-size: 0.6875rem;
   }
 
   .editor-header {
@@ -383,6 +668,10 @@
 
   .editor-status.error {
     color: var(--color-error);
+  }
+
+  .editor-status.warning {
+    color: var(--color-warning, #a66a00);
   }
 
   .save-button,

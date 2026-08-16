@@ -15,7 +15,10 @@
 
   export let project: ProjectModel;
   export let workspaceGeneration: number;
+  export let workspaceRevision: number;
   export let selectedDocumentId: DocumentId | null;
+  export let documentChangeVersions: Record<DocumentId, number>;
+  export let watchError: string | null;
 
   let editor: MarkdownEditor | undefined;
   let decisionDialog: HTMLDialogElement;
@@ -164,6 +167,11 @@
       >
         Editor
       </button>
+      {#if watchError}
+        <span class="watch-error" role="status" title={watchError}>
+          Live updates paused · use Refresh Workspace
+        </span>
+      {/if}
       <button
         type="button"
         class:active={activeView === 'map'}
@@ -180,7 +188,12 @@
       <MarkdownEditor
         bind:this={editor}
         document={selectedDocument}
+        {selectedDocumentId}
+        externalChangeVersion={selectedDocumentId
+          ? (documentChangeVersions[selectedDocumentId] ?? 0)
+          : 0}
         {workspaceGeneration}
+        {workspaceRevision}
       />
       <LinkInspector {project} {selectedDocumentId} />
     </div>
@@ -283,6 +296,15 @@
     border-color: var(--color-border-strong);
     background: var(--color-surface-raised);
     color: var(--color-foreground);
+  }
+
+  .watch-error {
+    overflow: hidden;
+    margin-left: auto;
+    color: var(--color-error);
+    font-size: 0.6875rem;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .workspace__panel {

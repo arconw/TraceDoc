@@ -8,6 +8,7 @@
 
   let appName = 'Simple Docs';
   let workspaceView: WorkspaceView | undefined;
+  let refreshing = false;
 
   async function openFolder() {
     const canOpen = await workspaceView?.prepareWorkspaceChange();
@@ -16,34 +17,66 @@
     await projectStore.openFolder();
   }
 
-  onMount(async () => {
-    try {
-      const appInfo = await invoke<AppInfo>('get_app_info');
-      appName = appInfo.name;
-      document.title = `${appInfo.name} ${appInfo.version}`;
-    } catch (error) {
-      console.error('Unable to load application information', error);
-    }
+  async function refreshWorkspace() {
+    refreshing = true;
+    await projectStore.refreshWorkspace();
+    refreshing = false;
+  }
+
+  onMount(() => {
+    let unlisten: (() => void) | undefined;
+    let destroyed = false;
+    void projectStore
+      .listenForWorkspaceUpdates()
+      .then((stop) => {
+        if (destroyed) stop();
+        else unlisten = stop;
+      })
+      .catch((error) => {
+        console.error('Unable to listen for workspace updates', error);
+      });
+    void invoke<AppInfo>('get_app_info')
+      .then((appInfo) => {
+        appName = appInfo.name;
+        document.title = `${appInfo.name} ${appInfo.version}`;
+      })
+      .catch((error) => {
+        console.error('Unable to load application information', error);
+      });
+    return () => {
+      destroyed = true;
+      unlisten?.();
+    };
   });
 </script>
 
 <main class="app-shell">
   <header class="app-header">
     <h1>{appName}</h1>
-    <button
-      type="button"
-      disabled={$projectStore.status === 'loading'}
-      onclick={openFolder}
-    >
-      {$projectStore.status === 'loading' ? 'Opening…' : 'Open Folder'}
-    </button>
+    <div class="app-header__actions">
+      {#if $projectStore.status === 'loaded'}
+        <button type="button" disabled={refreshing} onclick={refreshWorkspace}>
+          {refreshing ? 'Refreshing…' : 'Refresh Workspace'}
+        </button>
+      {/if}
+      <button
+        type="button"
+        disabled={$projectStore.status === 'loading'}
+        onclick={openFolder}
+      >
+        {$projectStore.status === 'loading' ? 'Opening…' : 'Open Folder'}
+      </button>
+    </div>
   </header>
   {#if $projectStore.status === 'loaded'}
     <WorkspaceView
       bind:this={workspaceView}
       project={$projectStore.project}
       workspaceGeneration={$projectStore.workspaceGeneration}
+      workspaceRevision={$projectStore.workspaceRevision}
       selectedDocumentId={$projectStore.selectedDocumentId}
+      documentChangeVersions={$projectStore.documentChangeVersions}
+      watchError={$projectStore.watchError}
     />
   {:else}
     <WorkspaceStatus />
@@ -75,6 +108,11 @@
     font-size: var(--font-size-md);
     font-weight: 600;
     letter-spacing: -0.01em;
+  }
+
+  .app-header__actions {
+    display: flex;
+    gap: var(--space-2);
   }
 
   button {

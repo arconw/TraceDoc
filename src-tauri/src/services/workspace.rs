@@ -148,11 +148,11 @@ impl WorkspaceScanner {
                 Err(()) => continue,
             };
 
-            if file_type.is_dir() {
-                if is_ignored_directory(&entry, &name) {
-                    continue;
-                }
+            if is_ignored_entry(&entry, &name, file_type.is_dir()) {
+                continue;
+            }
 
+            if file_type.is_dir() {
                 let id = folder_id(&relative_path);
                 self.folders.insert(
                     id.clone(),
@@ -193,8 +193,20 @@ impl WorkspaceScanner {
     }
 }
 
-fn is_ignored_directory(entry: &fs::DirEntry, name: &str) -> bool {
-    is_ignored_directory_name(name) || has_ignored_directory_attributes(entry)
+#[cfg(windows)]
+pub(crate) fn is_ignored_entry(entry: &fs::DirEntry, name: &str, is_dir: bool) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    let attributes = entry
+        .metadata()
+        .map(|metadata| metadata.file_attributes())
+        .unwrap_or(0);
+    is_ignored_entry_policy(name, is_dir, attributes)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn is_ignored_entry(_entry: &fs::DirEntry, name: &str, is_dir: bool) -> bool {
+    is_dir && is_ignored_directory_name(name)
 }
 
 fn is_ignored_directory_name(name: &str) -> bool {
@@ -204,17 +216,57 @@ fn is_ignored_directory_name(name: &str) -> bool {
             .any(|system_name| name.eq_ignore_ascii_case(system_name))
 }
 
+#[cfg(any(windows, test))]
+fn is_ignored_entry_policy(name: &str, is_dir: bool, attributes: u32) -> bool {
+    (is_dir && is_ignored_directory_name(name))
+        || has_windows_hidden_or_system_attributes(attributes)
+}
+
+pub(crate) fn ignored_relative_ancestor(
+    root: &Path,
+    relative: &str,
+    is_dir: bool,
+) -> Option<String> {
+    ignored_relative_ancestor_with(root, relative, is_dir, path_has_ignored_attributes)
+}
+
+fn ignored_relative_ancestor_with(
+    root: &Path,
+    relative: &str,
+    is_dir: bool,
+    ignored_attributes: impl Fn(&Path) -> bool,
+) -> Option<String> {
+    let segments: Vec<_> = relative.split('/').collect();
+    let mut current = root.to_path_buf();
+    let mut normalized = String::new();
+    for (index, segment) in segments.iter().enumerate() {
+        current.push(segment);
+        normalized = if normalized.is_empty() {
+            (*segment).to_owned()
+        } else {
+            format!("{normalized}/{segment}")
+        };
+        let segment_is_dir = index + 1 < segments.len() || is_dir;
+        if segment_is_dir && is_ignored_directory_name(segment) {
+            return Some(normalized);
+        }
+        if ignored_attributes(&current) {
+            return Some(normalized);
+        }
+    }
+    None
+}
+
 #[cfg(windows)]
-fn has_ignored_directory_attributes(entry: &fs::DirEntry) -> bool {
+fn path_has_ignored_attributes(path: &Path) -> bool {
     use std::os::windows::fs::MetadataExt;
 
-    entry
-        .metadata()
+    fs::metadata(path)
         .is_ok_and(|metadata| has_windows_hidden_or_system_attributes(metadata.file_attributes()))
 }
 
 #[cfg(not(windows))]
-fn has_ignored_directory_attributes(_entry: &fs::DirEntry) -> bool {
+fn path_has_ignored_attributes(_path: &Path) -> bool {
     false
 }
 
@@ -280,8 +332,9 @@ pub(crate) fn normalize_relative_path(path: &Path) -> Result<String, WorkspaceEr
 #[cfg(test)]
 mod tests {
     use super::{
-        has_windows_hidden_or_system_attributes, is_ignored_directory_name,
-        normalize_relative_path, scan_workspace, WorkspaceError, WINDOWS_FILE_ATTRIBUTE_HIDDEN,
+        has_windows_hidden_or_system_attributes, ignored_relative_ancestor_with,
+        is_ignored_directory_name, is_ignored_entry_policy, normalize_relative_path,
+        scan_workspace, WorkspaceError, WINDOWS_FILE_ATTRIBUTE_HIDDEN,
         WINDOWS_FILE_ATTRIBUTE_SYSTEM,
     };
     use std::{
@@ -347,6 +400,8 @@ mod tests {
             .expect("macOS metadata folder should be created");
         fs::write(workspace.path().join("overview.md"), "# Overview")
             .expect("overview should be written");
+        fs::write(workspace.path().join(".notes.md"), "# Notes")
+            .expect("dotfile document should be written");
         fs::write(workspace.path().join("backend/api.md"), "# API").expect("api should be written");
         fs::write(workspace.path().join("backend/auth.MD"), "# Auth")
             .expect("auth should be written");
@@ -386,7 +441,12 @@ mod tests {
         assert_eq!(folder_paths, ["", "assets", "backend"]);
         assert_eq!(
             document_paths,
-            ["backend/api.md", "backend/auth.MD", "overview.md"]
+            [
+                ".notes.md",
+                "backend/api.md",
+                "backend/auth.MD",
+                "overview.md"
+            ]
         );
         assert!(project.links.is_empty());
 
@@ -395,7 +455,10 @@ mod tests {
             .get("folder:.")
             .expect("root folder should exist");
         assert_eq!(root.child_folder_ids, ["folder:assets", "folder:backend"]);
-        assert_eq!(root.document_ids, ["document:overview.md"]);
+        assert_eq!(
+            root.document_ids,
+            ["document:.notes.md", "document:overview.md"]
+        );
 
         let backend = project
             .folders
@@ -513,5 +576,35 @@ mod tests {
         ));
         assert!(!has_windows_hidden_or_system_attributes(0));
         assert!(!has_windows_hidden_or_system_attributes(0x20));
+    }
+
+    #[test]
+    fn applies_the_same_ignore_policy_to_unix_dotfiles_and_windows_attributes() {
+        assert!(!is_ignored_entry_policy(".notes.md", false, 0));
+        assert!(is_ignored_entry_policy(".hidden", true, 0));
+        assert!(is_ignored_entry_policy(
+            "notes.md",
+            false,
+            WINDOWS_FILE_ATTRIBUTE_HIDDEN
+        ));
+        assert!(is_ignored_entry_policy(
+            "docs",
+            true,
+            WINDOWS_FILE_ATTRIBUTE_SYSTEM
+        ));
+    }
+
+    #[test]
+    fn returns_the_first_ignored_ancestor_for_direct_events() {
+        let root = Path::new("/workspace");
+        let ancestor =
+            ignored_relative_ancestor_with(root, "visible/hidden/child.md", false, |path| {
+                path == root.join("visible/hidden")
+            });
+        assert_eq!(ancestor.as_deref(), Some("visible/hidden"));
+        assert_eq!(
+            ignored_relative_ancestor_with(root, ".cache/child.md", false, |_| false).as_deref(),
+            Some(".cache")
+        );
     }
 }

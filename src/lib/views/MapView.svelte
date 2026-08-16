@@ -22,14 +22,20 @@
     beginMapLayout,
     completeEmptyMapLayout,
     completeMapLayout,
+    beginQueuedMapLayout,
+    cancelQueuedMapLayout,
+    completeQueuedMapLayout,
+    createMapLayoutRequestState,
     createMapEdgeTraceState,
     createMapLayoutSession,
     effectiveMapEdgeTraceId,
     failMapLayout,
     mapLayoutIsInteractive,
+    queueMapLayout,
     reduceMapEdgeTrace,
+    retryQueuedMapLayout,
   } from '../map/map-view-state';
-  import { projectToMapGraph } from '../map/project-graph';
+  import { mapLayoutSignature, projectToMapGraph } from '../map/project-graph';
   import type { DocumentId, ProjectModel } from '../types/workspace';
 
   export let project: ProjectModel;
@@ -42,9 +48,11 @@
     mapDocument: MapDocumentNode,
   };
   const edgeTypes = { mapRoute: MapRouteEdge };
-  const elk = new ELK({ workerFactory: () => new ElkWorker() });
+  let elk = createElk();
 
-  let requestedProject: ProjectModel | null = null;
+  let pendingProject: ProjectModel | null = null;
+  let layoutRequestState = createMapLayoutRequestState();
+  let layoutTimer: ReturnType<typeof setTimeout> | null = null;
   let layoutSession = createMapLayoutSession<MapLayout>();
   let layoutNodes: MapFlowNode[] = [];
   let layoutEdges: MapFlowEdge[] = [];
@@ -66,10 +74,7 @@
   let mapCanvas: HTMLDivElement;
   let sizeObserver: ResizeObserver | null = null;
 
-  $: if (project !== requestedProject) {
-    requestedProject = project;
-    void updateLayout(project);
-  }
+  $: scheduleLayout(project, mapLayoutSignature(project), visible);
 
   $: layoutNodes = layoutSession.layout?.nodes ?? [];
   $: layoutEdges = layoutSession.layout?.edges ?? [];
@@ -119,8 +124,55 @@
     layoutVersion += 1;
     flowMountVersion += 1;
     sizeObserver?.disconnect();
+    if (layoutTimer) clearTimeout(layoutTimer);
     elk.terminateWorker();
   });
+
+  function scheduleLayout(
+    nextProject: ProjectModel,
+    signature: string,
+    nextVisible: boolean,
+  ) {
+    if (
+      layoutRequestState.running &&
+      (!nextVisible || signature !== layoutRequestState.activeSignature)
+    ) {
+      cancelActiveLayout();
+    }
+    pendingProject = nextProject;
+    layoutRequestState = queueMapLayout(
+      layoutRequestState,
+      signature,
+      nextVisible,
+    );
+    if (layoutTimer) {
+      clearTimeout(layoutTimer);
+      layoutTimer = null;
+    }
+    if (!nextVisible || layoutRequestState.pendingSignature === null) return;
+    layoutTimer = setTimeout(() => {
+      layoutTimer = null;
+      const next = pendingProject;
+      layoutRequestState = beginQueuedMapLayout(layoutRequestState);
+      if (next) void updateLayout(next);
+    }, 40);
+  }
+
+  function createElk() {
+    return new ELK({ workerFactory: () => new ElkWorker() });
+  }
+
+  function cancelActiveLayout() {
+    layoutVersion += 1;
+    elk.terminateWorker();
+    elk = createElk();
+    layoutRequestState = cancelQueuedMapLayout(layoutRequestState);
+  }
+
+  function retryLayout() {
+    layoutRequestState = retryQueuedMapLayout(layoutRequestState);
+    scheduleLayout(project, mapLayoutSignature(project), visible);
+  }
 
   function scheduleFlowMount(
     nextVisible: boolean,
@@ -198,11 +250,13 @@
       const graph = projectToMapGraph(nextProject);
       if (Object.keys(graph.documents).length === 0) {
         layoutSession = completeEmptyMapLayout(layoutSession, version);
+        layoutRequestState = completeQueuedMapLayout(layoutRequestState);
         return;
       }
       const layout = await layoutMapGraph(graph, elk);
       if (version !== layoutVersion) return;
       layoutSession = completeMapLayout(layoutSession, version, layout);
+      layoutRequestState = completeQueuedMapLayout(layoutRequestState);
       layoutRevision += 1;
     } catch (error) {
       if (version !== layoutVersion) return;
@@ -211,6 +265,7 @@
         version,
         error instanceof Error ? error.message : String(error),
       );
+      layoutRequestState = completeQueuedMapLayout(layoutRequestState);
     }
   }
 
@@ -322,7 +377,7 @@
     <div class="map-state map-state--error" role="alert">
       <p>Unable to lay out the architecture map</p>
       <span>{message}</span>
-      <button type="button" onclick={() => updateLayout(project)}>Retry</button>
+      <button type="button" onclick={retryLayout}>Retry</button>
     </div>
   {:else}
     <div

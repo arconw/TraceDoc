@@ -86,3 +86,69 @@ export function mapLayoutIsInteractive<Layout>(
 ) {
   return session.status === 'ready' && visible && flowReady;
 }
+
+export interface MapLayoutRequestState {
+  activeSignature: string | null;
+  pendingSignature: string | null;
+  requestCount: number;
+  running: boolean;
+}
+
+export function createMapLayoutRequestState(): MapLayoutRequestState {
+  return {
+    activeSignature: null,
+    pendingSignature: null,
+    requestCount: 0,
+    running: false,
+  };
+}
+
+export function queueMapLayout(
+  state: MapLayoutRequestState,
+  signature: string,
+  visible: boolean,
+): MapLayoutRequestState {
+  if (!visible) return { ...state, pendingSignature: signature };
+  return signature === state.activeSignature
+    ? { ...state, pendingSignature: null }
+    : { ...state, pendingSignature: signature };
+}
+
+export function beginQueuedMapLayout(
+  state: MapLayoutRequestState,
+): MapLayoutRequestState {
+  return state.pendingSignature === null
+    ? state
+    : {
+        activeSignature: state.pendingSignature,
+        pendingSignature: null,
+        requestCount: state.requestCount + 1,
+        running: true,
+      };
+}
+
+export function completeQueuedMapLayout(
+  state: MapLayoutRequestState,
+): MapLayoutRequestState {
+  return { ...state, running: false };
+}
+
+export function cancelQueuedMapLayout(
+  state: MapLayoutRequestState,
+): MapLayoutRequestState {
+  return state.running
+    ? { ...state, activeSignature: null, running: false }
+    : state;
+}
+
+export function retryQueuedMapLayout(
+  state: MapLayoutRequestState,
+): MapLayoutRequestState {
+  return state.running || state.activeSignature === null
+    ? state
+    : {
+        ...state,
+        pendingSignature: state.activeSignature,
+        activeSignature: null,
+      };
+}

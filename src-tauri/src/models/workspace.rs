@@ -48,22 +48,51 @@ pub struct DocumentLink {
 #[serde(rename_all = "camelCase")]
 pub struct DocumentIndexUpdate {
     pub workspace_generation: u64,
+    pub workspace_revision: u64,
+    pub content_token: String,
+    pub save_warning: Option<String>,
     pub document: Document,
     pub links: Vec<DocumentLink>,
+    pub patches: Vec<WorkspacePatch>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DocumentReadResult {
     pub workspace_generation: u64,
+    pub workspace_revision: u64,
     pub content: String,
+    pub content_token: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceSnapshot {
     pub workspace_generation: u64,
+    pub workspace_revision: u64,
     pub project: ProjectModel,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspacePatch {
+    pub workspace_generation: u64,
+    pub workspace_revision: u64,
+    pub upserted_folders: Vec<Folder>,
+    pub removed_folder_ids: Vec<FolderId>,
+    pub upserted_documents: Vec<Document>,
+    pub removed_document_ids: Vec<DocumentId>,
+    pub upserted_links: Vec<DocumentLink>,
+    pub removed_link_ids: Vec<String>,
+    pub externally_changed_document_ids: Vec<DocumentId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceEventError {
+    pub workspace_generation: u64,
+    pub workspace_revision: u64,
+    pub message: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

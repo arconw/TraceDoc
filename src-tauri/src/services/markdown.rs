@@ -116,8 +116,12 @@ fn replace_document_index(
 
     Ok(DocumentIndexUpdate {
         workspace_generation,
+        workspace_revision: 0,
+        content_token: String::new(),
+        save_warning: None,
         document,
         links,
+        patches: Vec::new(),
     })
 }
 

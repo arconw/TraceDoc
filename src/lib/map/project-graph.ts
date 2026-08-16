@@ -90,6 +90,10 @@ export function projectToMapGraph(project: ProjectModel): MapGraph {
   };
 }
 
+export function mapLayoutSignature(project: ProjectModel): string {
+  return JSON.stringify(projectToMapGraph(project));
+}
+
 function sortIdsByPath<T extends { path: string }>(
   ids: string[],
   records: Record<string, T>,

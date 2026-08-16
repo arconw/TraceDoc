@@ -268,6 +268,7 @@ function layoutEdgesForFolder(
   folderId: string,
 ): ElkExtendedEdge[] {
   const edges: ElkExtendedEdge[] = [];
+  const relationships = new Set<string>();
 
   for (const link of graph.links) {
     const source = directChildForDocument(
@@ -282,6 +283,9 @@ function layoutEdgesForFolder(
     );
 
     if (!source || !target || source === target) continue;
+    const relationship = `${source}\u0000${target}`;
+    if (relationships.has(relationship)) continue;
+    relationships.add(relationship);
     edges.push({
       id: `layout:${folderId}:${link.id}`,
       sources: [`${source}:right`],
@@ -336,7 +340,7 @@ function layoutOptions() {
     'elk.layered.highDegreeNodes.treatment': 'true',
     'elk.layered.mergeEdges': 'false',
     'elk.layered.nodePlacement.favorStraightEdges': 'true',
-    'elk.layered.nodePlacement.strategy': 'NETWORK_SIMPLEX',
+    'elk.layered.nodePlacement.strategy': 'SIMPLE',
     'elk.layered.spacing.edgeEdgeBetweenLayers': '10',
     'elk.layered.spacing.edgeNodeBetweenLayers': '24',
     'elk.layered.spacing.nodeNodeBetweenLayers': '88',

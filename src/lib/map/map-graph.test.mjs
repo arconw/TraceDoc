@@ -21,20 +21,128 @@ async function loadTypeScript(relativePath) {
   return import(moduleUrl);
 }
 
-const { projectToMapGraph } = await loadTypeScript('./project-graph.ts');
+const { mapLayoutSignature, projectToMapGraph } =
+  await loadTypeScript('./project-graph.ts');
 const { layoutMapGraph } = await loadTypeScript('./elk-layout.ts');
 const { segmentIntersectsRectInterior } = await loadTypeScript('./routing.ts');
 const {
   beginMapLayout,
+  beginQueuedMapLayout,
+  cancelQueuedMapLayout,
+  completeQueuedMapLayout,
   completeEmptyMapLayout,
   completeMapLayout,
   createMapEdgeTraceState,
   createMapLayoutSession,
+  createMapLayoutRequestState,
   effectiveMapEdgeTraceId,
   failMapLayout,
   mapLayoutIsInteractive,
+  queueMapLayout,
   reduceMapEdgeTrace,
+  retryQueuedMapLayout,
 } = await loadTypeScript('./map-view-state.ts');
+
+test('ignores body-only changes in the map layout signature', () => {
+  const project = nestedProject();
+  const bodyOnly = structuredClone(project);
+  bodyOnly.documents['document:readme.md'].headings = [
+    { level: 2, text: 'Body heading' },
+  ];
+  assert.equal(mapLayoutSignature(bodyOnly), mapLayoutSignature(project));
+
+  bodyOnly.documents['document:readme.md'].title = 'Layout title changed';
+  assert.notEqual(mapLayoutSignature(bodyOnly), mapLayoutSignature(project));
+
+  const graphChange = structuredClone(project);
+  graphChange.links[0].resolved = false;
+  graphChange.links[0].targetDocumentId = null;
+  assert.notEqual(mapLayoutSignature(graphChange), mapLayoutSignature(project));
+});
+
+test('coalesces visible bursts and defers hidden layouts to the latest graph', () => {
+  let state = createMapLayoutRequestState();
+  state = queueMapLayout(state, 'graph-a', true);
+  state = queueMapLayout(state, 'graph-b', true);
+  state = queueMapLayout(state, 'graph-c', true);
+  state = beginQueuedMapLayout(state);
+  assert.equal(state.activeSignature, 'graph-c');
+  assert.equal(state.requestCount, 1);
+
+  state = queueMapLayout(state, 'hidden-a', false);
+  state = queueMapLayout(state, 'hidden-b', false);
+  assert.equal(state.requestCount, 1);
+  assert.equal(state.pendingSignature, 'hidden-b');
+  state = queueMapLayout(state, 'hidden-b', true);
+  state = beginQueuedMapLayout(state);
+  assert.equal(state.activeSignature, 'hidden-b');
+  assert.equal(state.requestCount, 2);
+
+  state = queueMapLayout(state, 'hidden-b', true);
+  state = beginQueuedMapLayout(state);
+  assert.equal(state.requestCount, 2);
+});
+
+test('cancels active layout work and starts only the latest queued job', () => {
+  const jobs = [];
+  let cancellations = 0;
+  let state = createMapLayoutRequestState();
+  const start = () => {
+    state = beginQueuedMapLayout(state);
+    jobs.push({ signature: state.activeSignature, cancelled: false });
+  };
+  const cancel = () => {
+    jobs.at(-1).cancelled = true;
+    cancellations += 1;
+    state = cancelQueuedMapLayout(state);
+  };
+
+  state = queueMapLayout(state, 'graph-a', true);
+  start();
+  cancel();
+  state = queueMapLayout(state, 'graph-b', true);
+  state = queueMapLayout(state, 'graph-c', true);
+  start();
+  state = completeQueuedMapLayout(state);
+
+  assert.deepEqual(jobs, [
+    { signature: 'graph-a', cancelled: true },
+    { signature: 'graph-c', cancelled: false },
+  ]);
+  assert.equal(cancellations, 1);
+  assert.equal(state.running, false);
+
+  state = queueMapLayout(state, 'graph-d', true);
+  start();
+  cancel();
+  state = queueMapLayout(state, 'graph-d', false);
+  assert.equal(cancellations, 2);
+  assert.equal(state.pendingSignature, 'graph-d');
+  assert.equal(state.running, false);
+});
+
+test('routes retry through cancellation for hide and signature changes', () => {
+  let state = createMapLayoutRequestState();
+  state = queueMapLayout(state, 'failed', true);
+  state = beginQueuedMapLayout(state);
+  state = completeQueuedMapLayout(state);
+
+  state = retryQueuedMapLayout(state);
+  state = beginQueuedMapLayout(state);
+  assert.equal(state.running, true);
+  state = cancelQueuedMapLayout(state);
+  state = queueMapLayout(state, 'failed', false);
+  assert.equal(state.running, false);
+  assert.equal(state.pendingSignature, 'failed');
+
+  state = queueMapLayout(state, 'failed', true);
+  state = beginQueuedMapLayout(state);
+  state = cancelQueuedMapLayout(state);
+  state = queueMapLayout(state, 'changed', true);
+  state = beginQueuedMapLayout(state);
+  assert.equal(state.activeSignature, 'changed');
+  assert.equal(state.requestCount, 4);
+});
 
 function nestedProject() {
   return {
