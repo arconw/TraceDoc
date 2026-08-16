@@ -122,10 +122,21 @@ impl WorkspaceWatcher {
             return Ok(());
         }
 
+        if !pending.is_empty() {
+            // Best-effort: if the workspace already moved on to a newer
+            // generation between the install above and here,
+            // `session.snapshot` (called by the caller right after this
+            // returns) will surface that authoritatively.
+            let _ = session.apply_external_changes(generation, &pending);
+        }
+
         // The native backend can report errors (e.g. an overflow or a
         // watched-subtree failure) while the initial scan is still running.
         // Surface them the same way `watch_loop` does for live errors below,
         // instead of letting them vanish along with a successful snapshot.
+        // Read the revision only after the reconciliation above so a
+        // buffered error alongside a nonempty patch is stamped with the
+        // revision the caller's own `session.snapshot` is about to observe.
         for message in buffered_errors {
             let workspace_revision = session.current_revision(generation).unwrap_or(0);
             let _ = app.emit(
@@ -136,14 +147,6 @@ impl WorkspaceWatcher {
                     message,
                 },
             );
-        }
-
-        if !pending.is_empty() {
-            // Best-effort: if the workspace already moved on to a newer
-            // generation between the install above and here,
-            // `session.snapshot` (called by the caller right after this
-            // returns) will surface that authoritatively.
-            let _ = session.apply_external_changes(generation, &pending);
         }
 
         thread::spawn(move || watch_loop(receiver, app, session, generation));
@@ -181,6 +184,31 @@ fn watch_loop<R: tauri::Runtime>(
             }
         }
 
+        if !changes.is_empty() {
+            match session.apply_external_changes(generation, &changes) {
+                Ok(Some(patch)) => {
+                    let _ = app.emit("workspace-patch", patch);
+                }
+                Ok(None) => {}
+                Err(error) if error.to_string().contains("workspace changed") => return,
+                Err(error) => {
+                    let workspace_revision = session.current_revision(generation).unwrap_or(0);
+                    let _ = app.emit(
+                        "workspace-watch-error",
+                        WorkspaceEventError {
+                            workspace_generation: generation,
+                            workspace_revision,
+                            message: error.to_string(),
+                        },
+                    );
+                }
+            }
+        }
+
+        // Read the revision only after the reconciliation above so a
+        // watcher error batched alongside a nonempty patch is stamped with
+        // the revision the patch (if any) just advanced to, not the value
+        // that was current before it.
         if let Some(message) = error_message {
             let workspace_revision = session.current_revision(generation).unwrap_or(0);
             let _ = app.emit(
@@ -191,27 +219,6 @@ fn watch_loop<R: tauri::Runtime>(
                     message,
                 },
             );
-        }
-        if changes.is_empty() {
-            continue;
-        }
-        match session.apply_external_changes(generation, &changes) {
-            Ok(Some(patch)) => {
-                let _ = app.emit("workspace-patch", patch);
-            }
-            Ok(None) => {}
-            Err(error) if error.to_string().contains("workspace changed") => return,
-            Err(error) => {
-                let workspace_revision = session.current_revision(generation).unwrap_or(0);
-                let _ = app.emit(
-                    "workspace-watch-error",
-                    WorkspaceEventError {
-                        workspace_generation: generation,
-                        workspace_revision,
-                        message: error.to_string(),
-                    },
-                );
-            }
         }
     }
 }
@@ -1268,6 +1275,193 @@ mod tests {
         );
         assert!(payloads[0].contains("synthetic overflow"));
         assert!(payloads[0].contains(&generation.to_string()));
+    }
+
+    #[test]
+    fn buffered_watcher_errors_paired_with_a_nonempty_patch_are_stamped_with_the_post_reconciliation_revision(
+    ) {
+        use crate::services::document::WorkspaceSession;
+        use std::sync::{Arc, Mutex};
+        use tauri::Listener;
+
+        // The P2 "stamp buffered errors after reconciliation" regression: a
+        // scan-window error buffered alongside a scan-window filesystem
+        // change that produces a nonempty patch. `finish` must not emit the
+        // error with the pre-reconciliation revision - `apply_external_changes`
+        // below bumps the revision past it, and `applyWorkspaceError` in
+        // `project-state.ts` discards any error whose revision is older
+        // than the workspace's current revision as stale.
+        let workspace = TestWorkspace::new();
+        fs::write(workspace.path().join("page.md"), "# Page").expect("page should be written");
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let injector = sender.clone();
+        let mut native = notify::recommended_watcher(move |event| {
+            let _ = sender.send(event);
+        })
+        .expect("native watcher should initialize");
+        native
+            .watch(workspace.path(), RecursiveMode::Recursive)
+            .expect("fixture should be watched");
+
+        let project = scan_workspace(workspace.path()).expect("workspace should scan");
+
+        fs::write(workspace.path().join("added.md"), "# Added")
+            .expect("a file created during the scan window should be written");
+        std::thread::sleep(Duration::from_millis(750));
+
+        injector
+            .send(Err(notify::Error::generic("synthetic overflow")))
+            .expect("the synthetic error should buffer alongside the real change above");
+
+        let armed = super::ArmedWatcher {
+            watcher: native,
+            receiver,
+        };
+
+        let session = WorkspaceSession::default();
+        let generation = session
+            .activate(workspace.path().to_path_buf(), project)
+            .expect("workspace should activate");
+
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let collector = received.clone();
+        handle.listen("workspace-watch-error", move |event| {
+            collector
+                .lock()
+                .expect("lock should not be poisoned")
+                .push(event.payload().to_owned());
+        });
+
+        let watcher = super::WorkspaceWatcher;
+        watcher
+            .finish(armed, handle, session.clone(), generation)
+            .expect("finish should succeed despite the buffered error");
+
+        let snapshot = session
+            .snapshot(generation)
+            .expect("the activated snapshot should be readable");
+        assert!(
+            snapshot.project.documents.contains_key("document:added.md"),
+            "the scan-window change must still be reconciled"
+        );
+        assert_eq!(
+            snapshot.workspace_revision, 2,
+            "a nonempty patch produced during finish must bump the revision past its \
+             pre-reconciliation value, or this test cannot distinguish the two revisions"
+        );
+
+        let payloads = received.lock().expect("lock should not be poisoned");
+        assert_eq!(
+            payloads.len(),
+            1,
+            "the buffered error should reach exactly one notification, not be dropped"
+        );
+        assert!(payloads[0].contains("synthetic overflow"));
+        let post_reconciliation_marker =
+            format!("\"workspaceRevision\":{}", snapshot.workspace_revision);
+        assert!(
+            payloads[0].contains(&post_reconciliation_marker),
+            "the emitted error must carry the post-reconciliation revision {} so \
+             applyWorkspaceError does not discard it as stale: {}",
+            snapshot.workspace_revision,
+            payloads[0]
+        );
+    }
+
+    #[test]
+    fn watch_loop_stamps_a_live_batch_error_with_the_post_reconciliation_revision_when_paired_with_a_nonempty_patch(
+    ) {
+        use crate::services::document::WorkspaceSession;
+        use std::sync::{Arc, Mutex};
+        use tauri::Listener;
+
+        // The same ordering hazard as `finish`'s P2 regression, but for a
+        // live batch: `watch_loop`'s own debounce window can coalesce a
+        // watcher error together with a real filesystem change into one
+        // batch. Stamping the error before `apply_external_changes` bumps
+        // the revision would make `applyWorkspaceError` in
+        // `project-state.ts` discard it as stale the moment the
+        // accompanying patch lands.
+        let workspace = TestWorkspace::new();
+        fs::write(workspace.path().join("page.md"), "# Page").expect("page should be written");
+        let project = scan_workspace(workspace.path()).expect("workspace should scan");
+
+        let session = WorkspaceSession::default();
+        let generation = session
+            .activate(workspace.path().to_path_buf(), project)
+            .expect("workspace should activate");
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let injector = sender.clone();
+        let mut native = notify::recommended_watcher(move |event| {
+            let _ = sender.send(event);
+        })
+        .expect("native watcher should initialize");
+        native
+            .watch(workspace.path(), RecursiveMode::Recursive)
+            .expect("fixture should be watched");
+
+        fs::write(workspace.path().join("added.md"), "# Added")
+            .expect("a live file creation should be written");
+        std::thread::sleep(Duration::from_millis(750));
+        injector
+            .send(Err(notify::Error::generic("synthetic overflow")))
+            .expect("the synthetic error should batch alongside the real change above");
+
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let collector = received.clone();
+        handle.listen("workspace-watch-error", move |event| {
+            collector
+                .lock()
+                .expect("lock should not be poisoned")
+                .push(event.payload().to_owned());
+        });
+
+        let loop_session = session.clone();
+        let loop_handle = handle.clone();
+        std::thread::spawn(move || super::watch_loop(receiver, loop_handle, loop_session, generation));
+
+        let snapshot = (0..40)
+            .find_map(|_| {
+                std::thread::sleep(Duration::from_millis(75));
+                session.snapshot(generation).ok().filter(|snapshot| {
+                    snapshot.project.documents.contains_key("document:added.md")
+                })
+            })
+            .expect("the live batch's change must be reconciled");
+        assert_eq!(
+            snapshot.workspace_revision, 2,
+            "a nonempty patch from a live batch must bump the revision past its \
+             pre-reconciliation value, or this test cannot distinguish the two revisions"
+        );
+
+        let payloads = (0..40)
+            .find_map(|_| {
+                std::thread::sleep(Duration::from_millis(75));
+                let payloads = received.lock().expect("lock should not be poisoned");
+                (!payloads.is_empty()).then(|| payloads.clone())
+            })
+            .expect("the buffered live error must reach a notification");
+        assert_eq!(
+            payloads.len(),
+            1,
+            "the buffered live error should reach exactly one notification, not be dropped"
+        );
+        assert!(payloads[0].contains("synthetic overflow"));
+        let post_reconciliation_marker =
+            format!("\"workspaceRevision\":{}", snapshot.workspace_revision);
+        assert!(
+            payloads[0].contains(&post_reconciliation_marker),
+            "the emitted live error must carry the post-reconciliation revision {} so \
+             applyWorkspaceError does not discard it as stale: {}",
+            snapshot.workspace_revision,
+            payloads[0]
+        );
     }
 
     #[cfg(unix)]
