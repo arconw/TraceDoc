@@ -1635,18 +1635,12 @@ fn cleanup_successful_windows_transaction(
 
 #[cfg(windows)]
 fn windows_recovery_matches(artifact: &WindowsRecoveryArtifact) -> bool {
-    let directory_matches = artifact
-        .directory
-        .metadata()
-        .ok()
-        .and_then(|_| windows_file_identity(&artifact.directory).ok())
+    let directory_matches = windows_file_identity(&artifact.directory).ok()
         == Some(artifact.directory_identity)
         && windows_path_identity(&artifact.directory_path).ok()
             == Some(artifact.directory_identity);
     let data = fs::read(&artifact.slot_path).ok();
-    let identity = fs::metadata(&artifact.slot_path)
-        .ok()
-        .and_then(|_| windows_file_identity(&artifact.file).ok());
+    let identity = windows_path_identity(&artifact.slot_path).ok();
     directory_matches
         && data.as_deref() == Some(artifact.bytes.as_slice())
         && identity == Some(artifact.identity)
@@ -3388,6 +3382,8 @@ fn preserve_line_endings(existing_content: &str, content: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::windows_path_identity;
     use super::{
         content_token, decode_recovery_artifact, encode_recovery_artifact, has_forbidden_backslash,
         open_workspace, read_document, recovery_reference_target, recovery_slot_name,
@@ -5240,6 +5236,84 @@ mod tests {
             fs::read_to_string(outside.path().join("secret.md"))
                 .expect("outside document should remain readable"),
             "Secret"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_identity_reflects_the_file_currently_at_the_path() {
+        let workspace = TestDirectory::new("windows-path-identity");
+        let path = workspace.path().join("identity.md");
+        fs::write(&path, "# Original").expect("document should be written");
+        let first_identity = windows_path_identity(&path).expect("first identity should resolve");
+
+        fs::remove_file(&path).expect("document should be removed");
+        fs::write(&path, "# Original").expect("document should be recreated");
+        let second_identity = windows_path_identity(&path).expect("second identity should resolve");
+
+        assert_ne!(
+            first_identity, second_identity,
+            "a replaced file at the same path must report a different identity"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_workspace_session_saves_a_writable_document() {
+        let workspace = TestDirectory::new("windows-save");
+        fs::write(workspace.path().join("page.md"), "# Original")
+            .expect("document should be written");
+        let (project, root) = open_workspace(workspace.path()).expect("workspace should open");
+        let session = WorkspaceSession::default();
+        let generation = session
+            .activate(root, project)
+            .expect("workspace session should activate");
+        let lease = session
+            .capture(generation)
+            .expect("workspace lease should be captured");
+
+        let update = session
+            .save_document(
+                &lease,
+                "page.md",
+                "# Changed",
+                &content_token("# Original"),
+                1,
+            )
+            .expect("a writable document should save on Windows");
+
+        assert_eq!(update.document.title.as_deref(), Some("Changed"));
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("page.md"))
+                .expect("saved document should be readable"),
+            "# Changed"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_workspace_session_reports_a_distinguishable_conflict_on_a_stale_token() {
+        let workspace = TestDirectory::new("windows-conflict");
+        fs::write(workspace.path().join("page.md"), "# Original")
+            .expect("document should be written");
+        let (project, root) = open_workspace(workspace.path()).expect("workspace should open");
+        let session = WorkspaceSession::default();
+        let generation = session
+            .activate(root, project)
+            .expect("workspace session should activate");
+        let lease = session
+            .capture(generation)
+            .expect("workspace lease should be captured");
+
+        let error = session
+            .save_document(&lease, "page.md", "# Changed", &content_token("# Stale"), 1)
+            .expect_err("a stale content token should be rejected as an external conflict");
+
+        assert!(error.to_string().contains("changed externally"));
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("page.md"))
+                .expect("original document should remain readable"),
+            "# Original"
         );
     }
 }
