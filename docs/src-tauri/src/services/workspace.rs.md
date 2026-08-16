@@ -7,7 +7,9 @@ Deterministic recursive full scan. Produces normalized folders/documents, applie
 ## API and scanner
 
 - `WorkspaceError` — invalid root, unavailable root, non-directory root, or I/O error; `fmt` implements the stable user-facing message and `Error` exposes the standard trait.
-- `scan_workspace(root)` — canonicalizes/validates root, recursively scans, constructs `ProjectModel`, indexes readable Markdown.
+- `scan_workspace(root)` — canonicalizes/validates root, recursively scans, constructs `ProjectModel`, indexes readable Markdown. Thin wrapper over `resolve_workspace_root` + `scan_canonical_root`.
+- `resolve_workspace_root(root)` — validates/canonicalizes root only; split out so a caller (`open_workspace`) can register a filesystem watch on the canonical root before the recursive scan runs, closing the scan-to-watch race.
+- `scan_canonical_root(root)` — recursively scans an already-canonical root; constructs `ProjectModel`, indexes readable Markdown.
 - `WorkspaceScanner` — root-relative accumulator for folder/document `BTreeMap`s.
 - `WorkspaceScanner::scan_directory(directory,parentId,isRoot)` — sorted directory traversal; creates hierarchy records and Markdown documents.
 

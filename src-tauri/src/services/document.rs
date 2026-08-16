@@ -5,7 +5,10 @@ use crate::{
     services::{
         markdown::refresh_document_index,
         watcher::{apply_project_changes, diff_project, WorkspaceChange},
-        workspace::{normalize_relative_path, scan_workspace, WorkspaceError},
+        workspace::{
+            normalize_relative_path, resolve_workspace_root, scan_canonical_root, scan_workspace,
+            WorkspaceError,
+        },
     },
 };
 use std::{
@@ -435,12 +438,8 @@ impl std::error::Error for DocumentError {}
 pub fn open_workspace(
     root: &Path,
 ) -> Result<(crate::models::workspace::ProjectModel, PathBuf), WorkspaceError> {
-    let project = scan_workspace(root)?;
-    let canonical_root =
-        fs::canonicalize(root).map_err(|source| WorkspaceError::RootUnavailable {
-            path: root.to_string_lossy().into_owned(),
-            source,
-        })?;
+    let canonical_root = resolve_workspace_root(root)?;
+    let project = scan_canonical_root(canonical_root.clone())?;
     Ok((project, canonical_root))
 }
 

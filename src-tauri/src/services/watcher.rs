@@ -11,7 +11,7 @@ use std::{
     ffi::OsStr,
     fs,
     path::{Path, PathBuf},
-    sync::{mpsc, Mutex},
+    sync::{mpsc, Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -39,19 +39,31 @@ struct PendingChange {
     reindex_existing: bool,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct WorkspaceWatcher {
-    active: Mutex<Option<RecommendedWatcher>>,
+    active: Arc<Mutex<Option<RecommendedWatcher>>>,
+}
+
+/// A native watch that has been registered with the OS but is not yet
+/// delivering events to a session. Returned by `WorkspaceWatcher::arm` and
+/// consumed by `WorkspaceWatcher::finish`.
+pub struct ArmedWatcher {
+    watcher: RecommendedWatcher,
+    receiver: mpsc::Receiver<notify::Result<Event>>,
 }
 
 impl WorkspaceWatcher {
-    pub fn start(
-        &self,
-        app: AppHandle,
-        session: crate::services::document::WorkspaceSession,
-        root: PathBuf,
-        generation: u64,
-    ) -> Result<(), String> {
+    /// Registers the native recursive filesystem watch for `root` and starts
+    /// buffering its events immediately - *before* the workspace is scanned -
+    /// so a file created, modified, or removed while the scan is still
+    /// running is queued here rather than silently missed. Replaces (and
+    /// tears down) any previously active watcher right away, matching the
+    /// prior all-in-one `start` behavior.
+    ///
+    /// Call `finish` once the workspace session has activated the freshly
+    /// scanned project to fold any buffered changes in and begin live event
+    /// delivery.
+    pub fn arm(&self, root: &Path) -> Result<ArmedWatcher, String> {
         self.active
             .lock()
             .map_err(|_| "The workspace watcher is unavailable".to_owned())?
@@ -62,8 +74,37 @@ impl WorkspaceWatcher {
         })
         .map_err(|error| format!("Unable to create workspace watcher: {error}"))?;
         watcher
-            .watch(&root, RecursiveMode::Recursive)
+            .watch(root, RecursiveMode::Recursive)
             .map_err(|error| format!("Unable to watch workspace: {error}"))?;
+        Ok(ArmedWatcher { watcher, receiver })
+    }
+
+    /// Drains any changes buffered by `arm` while the scan was running and
+    /// folds them into the just-activated session through the same
+    /// incremental reconciliation path used for live events (so the
+    /// scan-to-watch gap never leaves the model stale), then begins normal
+    /// debounced event delivery for subsequent changes.
+    pub fn finish<R: tauri::Runtime>(
+        &self,
+        armed: ArmedWatcher,
+        app: AppHandle<R>,
+        session: crate::services::document::WorkspaceSession,
+        generation: u64,
+    ) -> Result<(), String> {
+        let ArmedWatcher { watcher, receiver } = armed;
+
+        let mut pending = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            if let Ok(event) = event {
+                pending.extend(normalize_event(event));
+            }
+        }
+        if !pending.is_empty() {
+            // Best-effort: if the workspace already moved on to a newer
+            // generation, `session.snapshot` (called by the caller right
+            // after this returns) will surface that authoritatively.
+            let _ = session.apply_external_changes(generation, &pending);
+        }
 
         thread::spawn(move || watch_loop(receiver, app, session, generation));
         let mut active = self
@@ -75,9 +116,9 @@ impl WorkspaceWatcher {
     }
 }
 
-fn watch_loop(
+fn watch_loop<R: tauri::Runtime>(
     receiver: mpsc::Receiver<notify::Result<Event>>,
-    app: AppHandle,
+    app: AppHandle<R>,
     session: crate::services::document::WorkspaceSession,
     generation: u64,
 ) {
@@ -935,6 +976,71 @@ mod tests {
                 .is_some_and(|event| event.paths.iter().any(|path| path == &created_path))
         });
         assert!(observed, "native watcher should report the created file");
+    }
+
+    #[test]
+    fn reconciles_changes_made_between_arming_the_watcher_and_the_initial_scan() {
+        use crate::services::document::WorkspaceSession;
+
+        let workspace = TestWorkspace::new();
+        fs::write(workspace.path().join("page.md"), "# Page").expect("page should be written");
+        fs::write(workspace.path().join("stale.md"), "# Stale")
+            .expect("stale file should be written");
+
+        let watcher = super::WorkspaceWatcher::default();
+        let armed = watcher.arm(workspace.path()).expect("watcher should arm");
+
+        // This scan stands in for the initial `open_workspace` scan, which in
+        // production now always runs *after* the watch has been armed above.
+        let baseline = scan_workspace(workspace.path()).expect("workspace should scan");
+        assert!(baseline.documents.contains_key("document:page.md"));
+        assert!(baseline.documents.contains_key("document:stale.md"));
+        assert!(!baseline.documents.contains_key("document:added.md"));
+
+        // Mutate the workspace after the scan has already produced its
+        // snapshot, i.e. exactly the race the P1 regression described: a
+        // create, a modify, and a delete that the scan can no longer see.
+        fs::write(workspace.path().join("added.md"), "# Added")
+            .expect("a file created during the scan window should be written");
+        fs::write(workspace.path().join("page.md"), "# Changed")
+            .expect("a file modified during the scan window should be written");
+        fs::remove_file(workspace.path().join("stale.md"))
+            .expect("a file removed during the scan window should be removed");
+
+        // Give the native watcher, armed before the scan started, a moment
+        // to actually deliver these events into its channel.
+        std::thread::sleep(Duration::from_millis(750));
+
+        let session = WorkspaceSession::default();
+        let generation = session
+            .activate(workspace.path().to_path_buf(), baseline)
+            .expect("workspace session should activate");
+
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        watcher
+            .finish(armed, handle, session.clone(), generation)
+            .expect("watcher should finish arming");
+
+        let snapshot = session
+            .snapshot(generation)
+            .expect("the activated snapshot should be readable");
+
+        assert!(
+            snapshot.project.documents.contains_key("document:added.md"),
+            "a file created during the scan window must not be lost until a manual refresh"
+        );
+        assert!(
+            !snapshot.project.documents.contains_key("document:stale.md"),
+            "a file removed during the scan window must not linger until a manual refresh"
+        );
+        assert_eq!(
+            snapshot.project.documents["document:page.md"]
+                .title
+                .as_deref(),
+            Some("Changed"),
+            "a file modified during the scan window must be reconciled without a manual refresh"
+        );
     }
 
     #[cfg(unix)]

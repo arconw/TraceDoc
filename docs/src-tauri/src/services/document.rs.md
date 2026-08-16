@@ -36,7 +36,7 @@ Authoritative workspace session, optimistic document I/O, revision history, watc
 ## Errors and public file API
 
 - `DocumentError` — string error; `new`, `workspace_changed`, `fmt`/`Display`, and `Error` implementations.
-- `open_workspace(root)` — full [`scan_workspace`](workspace.rs.md), canonical root, recovery cleanup.
+- `open_workspace(root)` — resolves/canonicalizes root then scans it (via [`resolve_workspace_root`/`scan_canonical_root`](workspace.rs.md)), returning the project paired with its canonical root.
 - free `read_document(root,path)` — validated direct read.
 - free `write_document(root,path,content)` — direct optimistic write using current disk token.
 - `write_document_if_current(...)` / `write_document_if_current_with_hook(...)` — resolve/read/token-check, preserve line endings, transactional replace, return token/warning; hook enables deterministic race tests.
