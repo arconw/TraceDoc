@@ -28,14 +28,9 @@ pub async fn open_workspace(
         canonical_root,
         workspace_generation,
     )?;
-    let session = session.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        session
-            .refresh_workspace(workspace_generation)
-            .map_err(|error| error.to_string())
-    })
-    .await
-    .map_err(|error| format!("The workspace scan could not be completed: {error}"))?
+    session
+        .snapshot(workspace_generation)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]

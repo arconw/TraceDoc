@@ -1,6 +1,6 @@
-import { invoke } from '@tauri-apps/api/core';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import { open } from '@tauri-apps/plugin-dialog';
+import { invoke as tauriInvoke } from '@tauri-apps/api/core';
+import { listen as tauriListen, type UnlistenFn } from '@tauri-apps/api/event';
+import { open as tauriOpen } from '@tauri-apps/plugin-dialog';
 import { writable } from 'svelte/store';
 import type {
   DocumentId,
@@ -19,11 +19,26 @@ import {
   type ProjectState,
 } from './project-state';
 
+export interface ProjectStoreDependencies {
+  open: typeof tauriOpen;
+  invoke: typeof tauriInvoke;
+  listen: typeof tauriListen;
+}
+
+const defaultDependencies: ProjectStoreDependencies = {
+  open: tauriOpen,
+  invoke: tauriInvoke,
+  listen: tauriListen,
+};
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function createProjectStore() {
+export function createProjectStore(
+  dependencies: ProjectStoreDependencies = defaultDependencies,
+) {
+  const { open, invoke, listen } = dependencies;
   const { subscribe, set, update } = writable<ProjectState>({
     status: 'empty',
   });

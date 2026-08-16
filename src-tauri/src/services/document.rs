@@ -95,6 +95,25 @@ impl WorkspaceSession {
         Ok(state.generation)
     }
 
+    pub fn snapshot(&self, expected_generation: u64) -> Result<WorkspaceSnapshot, DocumentError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| DocumentError::new("The workspace session is unavailable"))?;
+        if state.generation != expected_generation {
+            return Err(DocumentError::workspace_changed());
+        }
+        let workspace = state
+            .workspace
+            .as_ref()
+            .ok_or_else(|| DocumentError::new("No workspace is currently open"))?;
+        Ok(WorkspaceSnapshot {
+            workspace_generation: expected_generation,
+            workspace_revision: workspace.revision,
+            project: workspace.project.clone(),
+        })
+    }
+
     pub fn capture(&self, expected_generation: u64) -> Result<WorkspaceLease, DocumentError> {
         let state = self
             .state
@@ -3656,6 +3675,46 @@ mod tests {
                 .expect("saved document should be readable"),
             "# Changed\n\n[[target]]"
         );
+    }
+
+    #[test]
+    fn open_workspace_pairs_a_canonical_root_with_the_scanned_project() {
+        let workspace = TestDirectory::new("open-workspace-pairing");
+        fs::write(workspace.path().join("page.md"), "# Page").expect("page should be written");
+        let missing = workspace.path().join("missing-child");
+
+        let (project, root) = open_workspace(workspace.path()).expect("workspace should open");
+
+        assert_eq!(
+            root,
+            fs::canonicalize(workspace.path()).expect("workspace root should canonicalize")
+        );
+        assert!(project.documents.contains_key("document:page.md"));
+        assert!(open_workspace(&missing).is_err());
+    }
+
+    #[test]
+    fn activating_a_workspace_returns_its_snapshot_without_rescanning_disk() {
+        let workspace = TestDirectory::new("activate-snapshot");
+        fs::write(workspace.path().join("page.md"), "# Page").expect("page should be written");
+        let (project, root) = open_workspace(workspace.path()).expect("workspace should open");
+        let session = WorkspaceSession::default();
+        let generation = session
+            .activate(root, project)
+            .expect("workspace session should activate");
+
+        fs::write(workspace.path().join("added.md"), "# Added")
+            .expect("an out-of-band document should be written after activation");
+
+        let snapshot = session
+            .snapshot(generation)
+            .expect("the active snapshot should be readable");
+
+        assert_eq!(snapshot.workspace_generation, generation);
+        assert_eq!(snapshot.workspace_revision, 1);
+        assert!(snapshot.project.documents.contains_key("document:page.md"));
+        assert!(!snapshot.project.documents.contains_key("document:added.md"));
+        assert!(session.snapshot(generation + 1).is_err());
     }
 
     #[test]
