@@ -4,6 +4,7 @@
   import { projectStore } from './lib/stores/project';
   import type { AppInfo } from './lib/types/app';
   import WorkspaceStatus from './lib/views/WorkspaceStatus.svelte';
+  import WorkspaceView from './lib/views/WorkspaceView.svelte';
 
   let appName = 'Simple Docs';
 
@@ -29,13 +30,22 @@
       {$projectStore.status === 'loading' ? 'Opening…' : 'Open Folder'}
     </button>
   </header>
-  <WorkspaceStatus />
+  {#if $projectStore.status === 'loaded'}
+    <WorkspaceView
+      project={$projectStore.project}
+      selectedDocumentId={$projectStore.selectedDocumentId}
+    />
+  {:else}
+    <WorkspaceStatus />
+  {/if}
 </main>
 
 <style>
   .app-shell {
     display: grid;
-    min-height: 100vh;
+    height: 100vh;
+    min-width: 0;
+    min-height: 0;
     grid-template-rows: var(--header-height) 1fr;
     background: var(--color-background);
   }

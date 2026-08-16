@@ -9,6 +9,7 @@
     sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
+  --font-family-mono: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
   --space-1: 0.25rem;
   --space-2: 0.5rem;
   --space-3: 0.75rem;
@@ -18,10 +19,15 @@
   --color-background: #111318;
   --color-surface: #171a20;
   --color-surface-raised: #20242c;
+  --color-surface-hover: #22262e;
   --color-foreground: #f2f4f7;
+  --color-foreground-subtle: #c9ced7;
   --color-muted: #959ca8;
+  --color-muted-dim: #6f7682;
   --color-border: #282d36;
   --color-border-strong: #454c59;
+  --color-selection: #263650;
+  --color-selection-foreground: #f5f8ff;
   --color-error: #e88b8b;
   --color-focus: #8aacf8;
   --font-size-sm: 0.875rem;

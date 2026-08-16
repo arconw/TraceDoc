@@ -1,12 +1,16 @@
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { writable } from 'svelte/store';
-import type { ProjectModel } from '../types/workspace';
+import type { DocumentId, ProjectModel } from '../types/workspace';
 
 export type ProjectState =
   | { status: 'empty' }
   | { status: 'loading' }
-  | { status: 'loaded'; project: ProjectModel }
+  | {
+      status: 'loaded';
+      project: ProjectModel;
+      selectedDocumentId: DocumentId | null;
+    }
   | { status: 'error'; message: string };
 
 function errorMessage(error: unknown): string {
@@ -14,7 +18,9 @@ function errorMessage(error: unknown): string {
 }
 
 function createProjectStore() {
-  const { subscribe, set } = writable<ProjectState>({ status: 'empty' });
+  const { subscribe, set, update } = writable<ProjectState>({
+    status: 'empty',
+  });
 
   return {
     subscribe,
@@ -42,10 +48,19 @@ function createProjectStore() {
         const project = await invoke<ProjectModel>('open_workspace', {
           rootPath: selectedPath,
         });
-        set({ status: 'loaded', project });
+        set({ status: 'loaded', project, selectedDocumentId: null });
       } catch (error) {
         set({ status: 'error', message: errorMessage(error) });
       }
+    },
+    selectDocument(documentId: DocumentId) {
+      update((state) => {
+        if (state.status !== 'loaded' || !state.project.documents[documentId]) {
+          return state;
+        }
+
+        return { ...state, selectedDocumentId: documentId };
+      });
     },
   };
 }
