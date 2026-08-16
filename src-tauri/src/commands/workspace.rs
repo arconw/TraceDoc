@@ -38,12 +38,18 @@ pub async fn open_workspace<R: tauri::Runtime>(
         .map_err(|error| format!("The workspace scan could not be completed: {error}"))??;
 
     let workspace_generation = session
-        .activate(canonical_root, project)
+        .activate(canonical_root.clone(), project)
         .map_err(|error| error.to_string())?;
 
     let finish_session = session.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        watcher.finish(armed_watcher, app, finish_session, workspace_generation)
+        watcher.finish(
+            armed_watcher,
+            &canonical_root,
+            app,
+            finish_session,
+            workspace_generation,
+        )
     })
     .await
     .map_err(|error| format!("The workspace watcher could not start: {error}"))??;

@@ -52,9 +52,15 @@ pub struct WorkspaceWatcher;
 /// A native watch that has been registered with the OS but is not yet
 /// delivering events to a session. Returned by `WorkspaceWatcher::arm` and
 /// consumed by `WorkspaceWatcher::finish`.
+///
+/// `root_identity` is the filesystem-object identity observed for the
+/// watched root at the moment `arm` registered the watch, kept so `finish`
+/// can detect the narrow race where a different directory has since been
+/// moved into that same path (see `WorkspaceWatcher::finish`).
 pub struct ArmedWatcher {
     watcher: RecommendedWatcher,
     receiver: mpsc::Receiver<notify::Result<Event>>,
+    root_identity: Option<RootIdentity>,
 }
 
 impl WorkspaceWatcher {
@@ -79,7 +85,12 @@ impl WorkspaceWatcher {
         watcher
             .watch(root, RecursiveMode::Recursive)
             .map_err(|error| format!("Unable to watch workspace: {error}"))?;
-        Ok(ArmedWatcher { watcher, receiver })
+        let root_identity = capture_root_identity(root);
+        Ok(ArmedWatcher {
+            watcher,
+            receiver,
+            root_identity,
+        })
     }
 
     /// Drains any changes (and errors) buffered by `arm` while the scan was
@@ -96,14 +107,34 @@ impl WorkspaceWatcher {
     /// changes and errors discarded) without touching whatever the newer
     /// request installed. The caller's subsequent `session.snapshot(generation)`
     /// call surfaces that loss to the (stale) caller authoritatively.
+    ///
+    /// Before any of that, revalidates that `root`'s filesystem-object
+    /// identity still matches what `arm` observed when it registered the
+    /// watch. Path-based watch backends (Linux inotify in particular) stay
+    /// bound to the object they resolved `root` to at `watch(2)` time, not
+    /// to whatever the path currently names; if something external renamed
+    /// that object away and moved a different one into `root`'s path while
+    /// the scan was running, `armed` is silently watching the wrong,
+    /// vanished directory while the scan (path-based, so it reads whatever
+    /// is at `root` right now) already picked up the replacement. When a
+    /// mismatch is detected, `armed` is discarded and a fresh watch is
+    /// armed on `root` in its place before draining/installing proceeds, so
+    /// the watcher that ends up installed tracks the replacement directory
+    /// the session just activated. This is a narrow, low-probability race -
+    /// it requires an external directory swap at the exact canonical path
+    /// during the scan window - not a concern in ordinary single-writer use.
     pub fn finish<R: tauri::Runtime>(
         &self,
         armed: ArmedWatcher,
+        root: &Path,
         app: AppHandle<R>,
         session: crate::services::document::WorkspaceSession,
         generation: u64,
     ) -> Result<(), String> {
-        let ArmedWatcher { watcher, receiver } = armed;
+        let armed = self.revalidate_root_identity(armed, root);
+        let ArmedWatcher {
+            watcher, receiver, ..
+        } = armed;
 
         let mut pending = Vec::new();
         let mut buffered_errors = Vec::new();
@@ -152,6 +183,78 @@ impl WorkspaceWatcher {
         thread::spawn(move || watch_loop(receiver, app, session, generation));
         Ok(())
     }
+
+    /// Returns `armed` unchanged unless `root`'s filesystem-object identity
+    /// has diverged from the identity `arm` captured for it, in which case
+    /// `armed` is dropped and a fresh watch is armed on `root` in its place.
+    /// Best-effort: if identity cannot be determined on either side (an
+    /// unsupported platform, or a transient stat failure), no divergence is
+    /// assumed and `armed` is kept as-is, matching pre-revalidation
+    /// behavior. If re-arming fails, `armed` is also kept as-is rather than
+    /// leaving the workspace with no watcher at all.
+    fn revalidate_root_identity(&self, armed: ArmedWatcher, root: &Path) -> ArmedWatcher {
+        let diverged = armed
+            .root_identity
+            .zip(capture_root_identity(root))
+            .is_some_and(|(armed_identity, current_identity)| armed_identity != current_identity);
+        if !diverged {
+            return armed;
+        }
+        self.arm(root).unwrap_or(armed)
+    }
+}
+
+/// Opaque filesystem-object identity used to detect whether the directory
+/// backing a watched root's *path* has been swapped for a different
+/// directory. `(volume, file)` is `(device, inode)` on Unix and
+/// `(volume serial number, file index)` on Windows - the same identity
+/// pairs `services/document.rs` already relies on for its save-path
+/// revalidation, just captured for the workspace root instead of a
+/// document's save path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RootIdentity {
+    volume: u64,
+    file: u64,
+}
+
+#[cfg(unix)]
+fn capture_root_identity(root: &Path) -> Option<RootIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::metadata(root).ok()?;
+    Some(RootIdentity {
+        volume: metadata.dev(),
+        file: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn capture_root_identity(root: &Path) -> Option<RootIdentity> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(root)
+        .ok()?;
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut information) } == 0 {
+        return None;
+    }
+    Some(RootIdentity {
+        volume: u64::from(information.dwVolumeSerialNumber),
+        file: (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn capture_root_identity(_root: &Path) -> Option<RootIdentity> {
+    None
 }
 
 fn watch_loop<R: tauri::Runtime>(
@@ -1061,7 +1164,7 @@ mod tests {
         let app = tauri::test::mock_app();
         let handle = app.handle().clone();
         watcher
-            .finish(armed, handle, session.clone(), generation)
+            .finish(armed, workspace.path(), handle, session.clone(), generation)
             .expect("watcher should finish arming");
 
         let snapshot = session
@@ -1124,11 +1227,23 @@ mod tests {
 
         // `b`, the later/winning request, finishes first.
         watcher
-            .finish(armed_b, handle.clone(), session.clone(), generation_b)
+            .finish(
+                armed_b,
+                workspace_b.path(),
+                handle.clone(),
+                session.clone(),
+                generation_b,
+            )
             .expect("b should finish");
         // `a`'s belated finish arrives after `b` has already won.
         watcher
-            .finish(armed_a, handle, session.clone(), generation_a)
+            .finish(
+                armed_a,
+                workspace_a.path(),
+                handle,
+                session.clone(),
+                generation_a,
+            )
             .expect("a's stale finish should be a benign no-op");
 
         // `a` is stale and must be reported as such...
@@ -1185,7 +1300,13 @@ mod tests {
         let app = tauri::test::mock_app();
         let handle = app.handle().clone();
         watcher
-            .finish(armed_existing, handle, session.clone(), generation_existing)
+            .finish(
+                armed_existing,
+                existing.path(),
+                handle,
+                session.clone(),
+                generation_existing,
+            )
             .expect("existing should finish");
 
         // Arm a second watch for a would-be reopen, then simulate its scan
@@ -1243,6 +1364,7 @@ mod tests {
         let armed = super::ArmedWatcher {
             watcher: native,
             receiver,
+            root_identity: None,
         };
 
         let project = scan_workspace(workspace.path()).expect("workspace should scan");
@@ -1264,7 +1386,7 @@ mod tests {
 
         let watcher = super::WorkspaceWatcher;
         watcher
-            .finish(armed, handle, session.clone(), generation)
+            .finish(armed, workspace.path(), handle, session.clone(), generation)
             .expect("finish should succeed despite the buffered error");
 
         let payloads = received.lock().expect("lock should not be poisoned");
@@ -1317,6 +1439,7 @@ mod tests {
         let armed = super::ArmedWatcher {
             watcher: native,
             receiver,
+            root_identity: None,
         };
 
         let session = WorkspaceSession::default();
@@ -1337,7 +1460,7 @@ mod tests {
 
         let watcher = super::WorkspaceWatcher;
         watcher
-            .finish(armed, handle, session.clone(), generation)
+            .finish(armed, workspace.path(), handle, session.clone(), generation)
             .expect("finish should succeed despite the buffered error");
 
         let snapshot = session
@@ -1493,5 +1616,75 @@ mod tests {
             project,
             scan_workspace(workspace.path()).expect("symlink policy should match full scan")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finish_re_arms_when_the_watched_root_is_replaced_at_the_same_path_during_the_scan_window() {
+        use crate::services::document::WorkspaceSession;
+
+        // Narrow edge case (low-probability, not ordinary use): between
+        // `arm` registering the native watch and `finish` installing it,
+        // something external renames the watched directory away and moves
+        // a *different* directory into that exact canonical path. Linux
+        // inotify stays bound to the object it originally resolved `root`
+        // to, not to whatever the path names now, so without revalidation
+        // the installed watcher would silently keep watching the
+        // renamed-away, no-longer-reachable original while the scan (and
+        // the session it activates) already read the replacement. This
+        // requires an external directory swap at the exact canonical path
+        // during the scan window and is unlikely outside adversarial or
+        // heavily scripted environments.
+        let workspace = TestWorkspace::new();
+        let root = workspace.path().to_path_buf();
+        fs::write(root.join("old.md"), "# Old").expect("original file should be written");
+
+        let watcher = super::WorkspaceWatcher;
+        let armed = watcher
+            .arm(&root)
+            .expect("watcher should arm on the original directory");
+
+        let displaced = root.with_file_name(format!(
+            "{}-displaced",
+            root.file_name()
+                .expect("fixture root should have a name")
+                .to_string_lossy()
+        ));
+        fs::rename(&root, &displaced).expect("the original directory should be renamed away");
+        fs::create_dir_all(&root)
+            .expect("a replacement directory should be created at the same path");
+        fs::write(root.join("new.md"), "# New").expect("the replacement file should be written");
+
+        let project = scan_workspace(&root).expect("scan should read the replacement directory");
+        assert!(project.documents.contains_key("document:new.md"));
+        assert!(!project.documents.contains_key("document:old.md"));
+
+        let session = WorkspaceSession::default();
+        let generation = session
+            .activate(root.clone(), project)
+            .expect("workspace should activate");
+
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        watcher
+            .finish(armed, &root, handle, session.clone(), generation)
+            .expect("finish should re-arm on the replacement directory");
+
+        fs::write(root.join("live.md"), "# Live")
+            .expect("a live file should be written to the replacement directory");
+        let observed = (0..40).any(|_| {
+            std::thread::sleep(Duration::from_millis(75));
+            session
+                .snapshot(generation)
+                .map(|snapshot| snapshot.project.documents.contains_key("document:live.md"))
+                .unwrap_or(false)
+        });
+        assert!(
+            observed,
+            "the watcher must track the replacement directory living at root's path, \
+             not the renamed-away original it was armed on"
+        );
+
+        let _ = fs::remove_dir_all(&displaced);
     }
 }
