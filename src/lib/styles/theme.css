@@ -30,6 +30,13 @@
   --color-selection-foreground: #f5f8ff;
   --color-error: #e88b8b;
   --color-focus: #8aacf8;
+  --color-map-background: #0e1116;
+  --color-map-folder: rgb(24 28 35 / 86%);
+  --color-map-folder-border: #343b47;
+  --color-map-document: #1e232b;
+  --color-map-document-hover: #252b35;
+  --color-map-document-border: #4a5362;
+  --color-map-edge: #7c899e;
   --font-size-sm: 0.875rem;
   --font-size-md: 1rem;
   --font-size-lg: 1.125rem;

@@ -13,7 +13,7 @@
     "format:check": "prettier --check . && cargo fmt --manifest-path src-tauri/Cargo.toml --check",
     "lint": "eslint .",
     "lint:rust": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings",
-    "test:frontend": "node --test src/lib/stores/project-state.test.mjs",
+    "test:frontend": "node --test src/lib/stores/project-state.test.mjs src/lib/map/map-graph.test.mjs",
     "tauri": "tauri"
   },
   "dependencies": {
@@ -24,7 +24,9 @@
     "@codemirror/state": "^6.7.1",
     "@codemirror/view": "^6.43.8",
     "@tauri-apps/api": "^2.0.0",
-    "@tauri-apps/plugin-dialog": "^2.7.2"
+    "@tauri-apps/plugin-dialog": "^2.7.2",
+    "@xyflow/svelte": "^1.6.2",
+    "elkjs": "^0.12.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.0.0",

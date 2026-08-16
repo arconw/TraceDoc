@@ -5,9 +5,13 @@
   import Sidebar from '../components/Sidebar.svelte';
   import { projectStore } from '../stores/project';
   import type { DocumentId, ProjectModel } from '../types/workspace';
+  import MapView from './MapView.svelte';
 
   type PendingAction =
-    { kind: 'document'; documentId: DocumentId } | { kind: 'workspace' };
+    | { kind: 'document'; documentId: DocumentId; openEditor: boolean }
+    | {
+        kind: 'workspace';
+      };
 
   export let project: ProjectModel;
   export let workspaceGeneration: number;
@@ -21,6 +25,8 @@
   let decisionError: string | null = null;
   let restoreFocus: HTMLElement | null = null;
   let workspaceResolver: ((proceed: boolean) => void) | null = null;
+  let activeView: 'editor' | 'map' = 'editor';
+  let mapInitialized = false;
 
   $: selectedDocument = selectedDocumentId
     ? project.documents[selectedDocumentId]
@@ -48,15 +54,26 @@
     });
   }
 
-  function requestDocument(documentId: DocumentId) {
-    if (documentId === selectedDocumentId || pendingAction) return;
+  function requestDocument(documentId: DocumentId, openEditor = false) {
+    if (pendingAction) return;
+
+    if (documentId === selectedDocumentId) {
+      if (openEditor) activeView = 'editor';
+      return;
+    }
 
     if (editor?.isDirty()) {
-      void openDecision({ kind: 'document', documentId });
+      void openDecision({ kind: 'document', documentId, openEditor });
       return;
     }
 
     projectStore.selectDocument(documentId);
+    if (openEditor) activeView = 'editor';
+  }
+
+  function showView(view: 'editor' | 'map') {
+    activeView = view;
+    if (view === 'map') mapInitialized = true;
   }
 
   async function openDecision(action: PendingAction) {
@@ -124,6 +141,7 @@
 
     if (proceed && action?.kind === 'document') {
       projectStore.selectDocument(action.documentId);
+      if (action.openEditor) activeView = 'editor';
     }
 
     if (action?.kind === 'workspace') resolver?.(proceed);
@@ -137,12 +155,45 @@
 <div class="workspace">
   <Sidebar {project} {selectedDocumentId} onSelectDocument={requestDocument} />
   <div class="workspace__content">
-    <MarkdownEditor
-      bind:this={editor}
-      document={selectedDocument}
-      {workspaceGeneration}
-    />
-    <LinkInspector {project} {selectedDocumentId} />
+    <nav class="view-switcher" aria-label="Workspace view">
+      <button
+        type="button"
+        class:active={activeView === 'editor'}
+        aria-pressed={activeView === 'editor'}
+        onclick={() => showView('editor')}
+      >
+        Editor
+      </button>
+      <button
+        type="button"
+        class:active={activeView === 'map'}
+        aria-pressed={activeView === 'map'}
+        onclick={() => showView('map')}
+      >
+        Map
+      </button>
+    </nav>
+    <div
+      class="workspace__panel workspace__editor"
+      hidden={activeView !== 'editor'}
+    >
+      <MarkdownEditor
+        bind:this={editor}
+        document={selectedDocument}
+        {workspaceGeneration}
+      />
+      <LinkInspector {project} {selectedDocumentId} />
+    </div>
+    {#if mapInitialized}
+      <div class="workspace__panel" hidden={activeView !== 'map'}>
+        <MapView
+          {project}
+          {selectedDocumentId}
+          visible={activeView === 'map'}
+          onOpenDocument={(documentId) => requestDocument(documentId, true)}
+        />
+      </div>
+    {/if}
   </div>
 </div>
 
@@ -201,6 +252,50 @@
     display: grid;
     min-width: 0;
     min-height: 0;
+    grid-template-rows: 2.5rem minmax(0, 1fr);
+  }
+
+  .view-switcher {
+    display: flex;
+    align-items: center;
+    gap: var(--space-1);
+    padding: 0 var(--space-3);
+    border-bottom: 1px solid var(--color-border);
+    background: var(--color-surface);
+  }
+
+  .view-switcher button {
+    min-width: 0;
+    padding: 0.3rem var(--space-3);
+    border-color: transparent;
+    background: transparent;
+    color: var(--color-muted);
+    font-weight: 550;
+  }
+
+  .view-switcher button:hover {
+    border-color: var(--color-border);
+    background: var(--color-surface-hover);
+    color: var(--color-foreground-subtle);
+  }
+
+  .view-switcher button.active {
+    border-color: var(--color-border-strong);
+    background: var(--color-surface-raised);
+    color: var(--color-foreground);
+  }
+
+  .workspace__panel {
+    min-width: 0;
+    min-height: 0;
+  }
+
+  .workspace__panel[hidden] {
+    display: none;
+  }
+
+  .workspace__editor {
+    display: grid;
     grid-template-rows: minmax(0, 1fr) 10.5rem;
   }
 
