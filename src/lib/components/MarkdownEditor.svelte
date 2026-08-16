@@ -33,6 +33,7 @@
     editorReadIsCurrent,
     retainedLocalBaseline,
   } from '../editor/request-state';
+  import { richMarkdownEditing } from '../editor/rich-markdown';
   import { projectStore } from '../stores/project';
   import type {
     Document as WorkspaceDocument,
@@ -232,10 +233,12 @@
         highlightActiveLine(),
         highlightSelectionMatches(),
         markdown(),
+        richMarkdownEditing,
         EditorState.readOnly.of(!editable),
         EditorView.editable.of(editable),
         EditorView.contentAttributes.of({
           'aria-label': 'Markdown source editor',
+          'aria-describedby': 'markdown-editor-help',
           spellcheck: 'false',
         }),
         EditorView.lineWrapping,
@@ -500,6 +503,7 @@
           {statusLabel}
         </span>
       </div>
+      <span class="editor-mode" aria-hidden="true">Markdown</span>
       <button
         type="button"
         class="save-button"
@@ -535,6 +539,11 @@
   {/if}
 
   <div class="editor-body">
+    <p id="markdown-editor-help" class="sr-only">
+      Markdown source editor. Control or Command B toggles bold. Control or
+      Command I toggles italic. Markdown punctuation becomes fully visible when
+      the cursor enters its formatted text.
+    </p>
     <div class="editor-host" bind:this={editorHost}></div>
 
     {#if !document && !activeDocument}
@@ -641,6 +650,13 @@
     gap: var(--space-2);
   }
 
+  .editor-mode {
+    margin-left: auto;
+    color: var(--color-muted-dim);
+    font-family: var(--font-family-mono);
+    font-size: 0.6875rem;
+  }
+
   .editor-name {
     overflow: hidden;
     color: var(--color-foreground);
@@ -715,6 +731,10 @@
     font-size: 0.875rem;
   }
 
+  .editor-host :global(.cm-editor.cm-focused) {
+    box-shadow: inset 0 0 0 1px var(--color-focus);
+  }
+
   .editor-host :global(.cm-scroller) {
     overflow: auto;
     font-family: inherit;
@@ -728,6 +748,89 @@
     min-height: 100%;
     padding: var(--space-5) var(--space-6) 30vh;
     caret-color: var(--color-foreground);
+  }
+
+  .editor-host :global(.cm-md-heading) {
+    color: var(--color-editor-heading);
+    font-family:
+      Inter,
+      ui-sans-serif,
+      -apple-system,
+      BlinkMacSystemFont,
+      'Segoe UI',
+      sans-serif;
+    font-weight: 700;
+    letter-spacing: -0.018em;
+  }
+
+  .editor-host :global(.cm-md-heading-1) {
+    font-size: 1.75em;
+  }
+
+  .editor-host :global(.cm-md-heading-2) {
+    font-size: 1.45em;
+  }
+
+  .editor-host :global(.cm-md-heading-3) {
+    font-size: 1.22em;
+  }
+
+  .editor-host :global(.cm-md-heading-4),
+  .editor-host :global(.cm-md-heading-5),
+  .editor-host :global(.cm-md-heading-6) {
+    font-size: 1.05em;
+  }
+
+  .editor-host :global(.cm-md-heading-line) {
+    padding-top: 0.42em;
+    padding-bottom: 0.16em;
+  }
+
+  .editor-host :global(.cm-md-strong) {
+    color: var(--color-foreground);
+    font-weight: 700;
+  }
+
+  .editor-host :global(.cm-md-emphasis) {
+    color: var(--color-foreground);
+    font-style: italic;
+  }
+
+  .editor-host :global(.cm-md-inline-code) {
+    padding: 0.08em 0.24em;
+    border: 1px solid var(--color-editor-code-border);
+    border-radius: 0.25rem;
+    background: var(--color-editor-code);
+    color: var(--color-editor-code-foreground);
+  }
+
+  .editor-host :global(.cm-md-link) {
+    color: var(--color-editor-link);
+    text-decoration-color: color-mix(
+      in srgb,
+      var(--color-editor-link) 48%,
+      transparent
+    );
+    text-decoration-line: underline;
+    text-underline-offset: 0.16em;
+  }
+
+  .editor-host :global(.cm-md-code-block-line) {
+    background: var(--color-editor-code);
+    color: var(--color-editor-code-foreground);
+  }
+
+  .editor-host :global(.cm-md-syntax) {
+    color: var(--color-editor-syntax);
+    opacity: 0.38;
+    transition:
+      color 80ms ease,
+      opacity 80ms ease;
+  }
+
+  .editor-host :global(.cm-md-syntax-active) {
+    color: var(--color-editor-syntax-active);
+    opacity: 1;
   }
 
   .editor-host :global(.cm-line) {
@@ -829,5 +932,47 @@
 
   .editor-empty--error span {
     color: var(--color-error);
+  }
+
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .editor-host :global(.cm-md-syntax) {
+      transition: none;
+    }
+  }
+
+  @media (forced-colors: active) {
+    .editor-host :global(.cm-editor.cm-focused) {
+      outline: 2px solid Highlight;
+      outline-offset: -2px;
+      box-shadow: none;
+    }
+
+    .editor-host :global(.cm-md-inline-code),
+    .editor-host :global(.cm-md-code-block-line) {
+      border-color: CanvasText;
+      background: Canvas;
+      color: CanvasText;
+    }
+
+    .editor-host :global(.cm-md-link),
+    .editor-host :global(.cm-md-syntax-active) {
+      color: LinkText;
+    }
+
+    .editor-host :global(.cm-md-syntax) {
+      color: GrayText;
+      opacity: 1;
+    }
   }
 </style>
