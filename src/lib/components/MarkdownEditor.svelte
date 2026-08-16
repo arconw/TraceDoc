@@ -13,7 +13,11 @@
     syntaxHighlighting,
   } from '@codemirror/language';
   import { markdown } from '@codemirror/lang-markdown';
-  import { highlightSelectionMatches, searchKeymap } from '@codemirror/search';
+  import {
+    highlightSelectionMatches,
+    openSearchPanel,
+    searchKeymap,
+  } from '@codemirror/search';
   import { EditorState } from '@codemirror/state';
   import {
     crosshairCursor,
@@ -40,12 +44,14 @@
     DocumentIndexUpdate,
     DocumentReadResult,
   } from '../types/workspace';
+  import { saveShortcutAction } from '../utils/ui-behavior';
 
   export let document: WorkspaceDocument | null;
   export let selectedDocumentId: string | null;
   export let externalChangeVersion: number;
   export let workspaceGeneration: number;
   export let workspaceRevision: number;
+  export let saveShortcutEnabled = true;
 
   let editorHost: HTMLDivElement;
   let editorView: EditorView | null = null;
@@ -106,17 +112,12 @@
     };
 
     const handleWindowSave = (event: KeyboardEvent) => {
-      if (
-        event.defaultPrevented ||
-        event.altKey ||
-        (!event.ctrlKey && !event.metaKey) ||
-        event.key.toLowerCase() !== 's'
-      ) {
-        return;
-      }
+      if (event.defaultPrevented) return;
+      const action = saveShortcutAction(event, saveShortcutEnabled);
+      if (action === 'ignore') return;
 
       event.preventDefault();
-      void save();
+      if (action === 'save') void save();
     };
 
     window.addEventListener('beforeunload', handleBeforeUnload);
@@ -137,6 +138,12 @@
 
   export function getSaveError() {
     return message;
+  }
+
+  export function find() {
+    if (!editorView || !activeDocument || status === 'loading') return;
+    editorView.focus();
+    openSearchPanel(editorView);
   }
 
   export async function save(): Promise<boolean> {
@@ -250,10 +257,15 @@
         }),
         keymap.of([
           {
+            key: 'Mod-Shift-s',
+            preventDefault: true,
+            run: () => true,
+          },
+          {
             key: 'Mod-s',
             preventDefault: true,
             run: () => {
-              void save();
+              if (saveShortcutEnabled) void save();
               return true;
             },
           },
@@ -508,6 +520,7 @@
         type="button"
         class="save-button"
         disabled={!dirty || status !== 'ready' || Boolean(conflict)}
+        aria-keyshortcuts="Control+S Meta+S"
         title="Save document (Ctrl/Cmd+S)"
         onclick={() => save()}
       >

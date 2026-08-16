@@ -9,6 +9,7 @@
   import ElkWorker from 'elkjs/lib/elk-worker.min.js?worker';
   import { onDestroy, tick } from 'svelte';
   import { SvelteSet } from 'svelte/reactivity';
+  import MapFlowActions from '../components/MapFlowActions.svelte';
   import MapDocumentNode from '../components/MapDocumentNode.svelte';
   import MapFolderNode from '../components/MapFolderNode.svelte';
   import MapRouteEdge from '../components/MapRouteEdge.svelte';
@@ -36,6 +37,13 @@
     retryQueuedMapLayout,
   } from '../map/map-view-state';
   import { mapLayoutSignature, projectToMapGraph } from '../map/project-graph';
+  import {
+    captureMapViewport,
+    mapViewportMountAction,
+    mapViewportRequestIsCurrent,
+    type MapViewport,
+    type SavedMapViewport,
+  } from '../map/viewport-lifecycle';
   import type { DocumentId, ProjectModel } from '../types/workspace';
 
   export let project: ProjectModel;
@@ -48,6 +56,13 @@
     mapDocument: MapDocumentNode,
   };
   const edgeTypes = { mapRoute: MapRouteEdge };
+
+  interface MapFlowApi {
+    fit: () => void;
+    getViewport: () => MapViewport;
+    restore: (viewport: MapViewport) => void;
+  }
+
   let elk = createElk();
 
   let pendingProject: ProjectModel | null = null;
@@ -71,10 +86,22 @@
   let layoutRevision = 0;
   let flowMountVersion = 0;
   let flowReady = false;
+  let flowInitialized = false;
+  let flowInitializedMountVersion = -1;
+  let flowInitializedLayoutRevision = -1;
+  let flowApiMountVersion = -1;
+  let flowApiLayoutRevision = -1;
+  let appliedViewportMountVersion = -1;
+  let previousFlowVisibility = false;
   let mapCanvas: HTMLDivElement;
   let sizeObserver: ResizeObserver | null = null;
+  let flowApi: MapFlowApi | null = null;
+  let fitWhenReady = false;
+  let graphSignature = '';
+  let savedViewport: SavedMapViewport | null = null;
 
-  $: scheduleLayout(project, mapLayoutSignature(project), visible);
+  $: graphSignature = mapLayoutSignature(project);
+  $: scheduleLayout(project, graphSignature, visible);
 
   $: layoutNodes = layoutSession.layout?.nodes ?? [];
   $: layoutEdges = layoutSession.layout?.edges ?? [];
@@ -125,14 +152,99 @@
     flowMountVersion += 1;
     sizeObserver?.disconnect();
     if (layoutTimer) clearTimeout(layoutTimer);
+    savedViewport = null;
     elk.terminateWorker();
   });
+
+  export function fit() {
+    savedViewport = null;
+    fitWhenReady = true;
+    if (!flowApi || !flowInitialized || !visible) return;
+    fitWhenReady = false;
+    flowApi.fit();
+  }
+
+  function registerFlowApi(
+    api: MapFlowApi,
+    mountVersion: number,
+    revision: number,
+  ) {
+    if (
+      !mapViewportRequestIsCurrent(
+        mountVersion,
+        revision,
+        flowMountVersion,
+        layoutRevision,
+        visible,
+      )
+    ) {
+      return;
+    }
+    flowApi = api;
+    flowApiMountVersion = mountVersion;
+    flowApiLayoutRevision = revision;
+    applyInitialViewport();
+  }
+
+  function handleFlowInit(mountVersion: number, revision: number) {
+    if (
+      !mapViewportRequestIsCurrent(
+        mountVersion,
+        revision,
+        flowMountVersion,
+        layoutRevision,
+        visible,
+      )
+    ) {
+      return;
+    }
+    flowInitialized = true;
+    flowInitializedMountVersion = mountVersion;
+    flowInitializedLayoutRevision = revision;
+    applyInitialViewport();
+  }
+
+  function applyInitialViewport() {
+    if (
+      !flowApi ||
+      !flowInitialized ||
+      flowApiMountVersion !== flowMountVersion ||
+      flowApiLayoutRevision !== layoutRevision ||
+      flowInitializedMountVersion !== flowMountVersion ||
+      flowInitializedLayoutRevision !== layoutRevision ||
+      appliedViewportMountVersion === flowMountVersion ||
+      !visible
+    ) {
+      return;
+    }
+
+    appliedViewportMountVersion = flowMountVersion;
+    const action = mapViewportMountAction(
+      savedViewport,
+      graphSignature,
+      layoutRevision,
+      fitWhenReady,
+    );
+    fitWhenReady = false;
+    if (action.kind === 'restore') flowApi.restore(action.viewport);
+    else flowApi.fit();
+  }
+
+  function saveCurrentViewport() {
+    if (!flowApi || !flowInitialized || status !== 'ready') return;
+    savedViewport = captureMapViewport(
+      graphSignature,
+      layoutRevision,
+      flowApi.getViewport(),
+    );
+  }
 
   function scheduleLayout(
     nextProject: ProjectModel,
     signature: string,
     nextVisible: boolean,
   ) {
+    if (savedViewport?.graphSignature !== signature) savedViewport = null;
     if (
       layoutRequestState.running &&
       (!nextVisible || signature !== layoutRequestState.activeSignature)
@@ -179,8 +291,16 @@
     nextStatus: typeof status,
     revision: number,
   ) {
+    if (previousFlowVisibility && !nextVisible) saveCurrentViewport();
+    previousFlowVisibility = nextVisible;
     const version = ++flowMountVersion;
     flowReady = false;
+    flowInitialized = false;
+    flowInitializedMountVersion = -1;
+    flowInitializedLayoutRevision = -1;
+    flowApiMountVersion = -1;
+    flowApiLayoutRevision = -1;
+    flowApi = null;
     sizeObserver?.disconnect();
     sizeObserver = null;
 
@@ -240,6 +360,7 @@
   }
 
   async function updateLayout(nextProject: ProjectModel) {
+    savedViewport = null;
     layoutSession = beginMapLayout(layoutSession, 'loading');
     const version = layoutSession.requestId;
     layoutVersion = version;
@@ -249,6 +370,7 @@
     try {
       const graph = projectToMapGraph(nextProject);
       if (Object.keys(graph.documents).length === 0) {
+        savedViewport = null;
         layoutSession = completeEmptyMapLayout(layoutSession, version);
         layoutRequestState = completeQueuedMapLayout(layoutRequestState);
         return;
@@ -260,6 +382,7 @@
       layoutRevision += 1;
     } catch (error) {
       if (version !== layoutVersion) return;
+      savedViewport = null;
       layoutSession = failMapLayout(
         layoutSession,
         version,
@@ -386,14 +509,16 @@
       bind:this={mapCanvas}
     >
       {#if flowReady && layoutNodes.length > 0}
+        {@const mountedFlowVersion = flowMountVersion}
+        {@const mountedLayoutRevision = layoutRevision}
         {#key layoutRevision}
           <SvelteFlow
             {nodes}
             {edges}
             {nodeTypes}
             {edgeTypes}
-            fitView
-            fitViewOptions={{ padding: 0.12, maxZoom: 1 }}
+            oninit={() =>
+              handleFlowInit(mountedFlowVersion, mountedLayoutRevision)}
             minZoom={0.08}
             maxZoom={2}
             nodesDraggable={false}
@@ -406,6 +531,10 @@
             onlyRenderVisibleElements
             aria-label="Interactive architecture map"
           >
+            <MapFlowActions
+              onReady={(api) =>
+                registerFlowApi(api, mountedFlowVersion, mountedLayoutRevision)}
+            />
             <Background
               variant={BackgroundVariant.Dots}
               gap={22}

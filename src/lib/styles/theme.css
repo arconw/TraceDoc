@@ -22,13 +22,14 @@
   --color-surface-hover: #22262e;
   --color-foreground: #f2f4f7;
   --color-foreground-subtle: #c9ced7;
-  --color-muted: #959ca8;
-  --color-muted-dim: #6f7682;
+  --color-muted: #b0b7c2;
+  --color-muted-dim: #9aa2af;
   --color-border: #282d36;
   --color-border-strong: #454c59;
   --color-selection: #263650;
   --color-selection-foreground: #f5f8ff;
   --color-error: #e88b8b;
+  --color-warning: #d5a85d;
   --color-focus: #8aacf8;
   --color-editor-heading: #f5f7fb;
   --color-editor-link: #91b4ff;
@@ -78,4 +79,20 @@ button,
 input,
 textarea {
   font: inherit;
+}
+
+button {
+  -webkit-tap-highlight-color: transparent;
+}
+
+body.resizing-sidebar,
+body.resizing-sidebar * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
+
+@media (forced-colors: active) {
+  :focus-visible {
+    outline-color: Highlight !important;
+  }
 }

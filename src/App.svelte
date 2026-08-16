@@ -3,14 +3,16 @@
   import { onMount } from 'svelte';
   import { projectStore } from './lib/stores/project';
   import type { AppInfo } from './lib/types/app';
+  import { applyAppInfo } from './lib/utils/app-identity';
   import WorkspaceStatus from './lib/views/WorkspaceStatus.svelte';
   import WorkspaceView from './lib/views/WorkspaceView.svelte';
 
-  let appName = 'Simple Docs';
+  let appName = 'TraceDoc';
   let workspaceView: WorkspaceView | undefined;
   let refreshing = false;
 
   async function openFolder() {
+    if ($projectStore.status === 'loading') return;
     const canOpen = await workspaceView?.prepareWorkspaceChange();
     if (canOpen === false) return;
 
@@ -19,13 +21,30 @@
 
   async function refreshWorkspace() {
     refreshing = true;
-    await projectStore.refreshWorkspace();
-    refreshing = false;
+    try {
+      await projectStore.refreshWorkspace();
+    } finally {
+      refreshing = false;
+    }
   }
 
   onMount(() => {
     let unlisten: (() => void) | undefined;
     let destroyed = false;
+    const handleShortcut = (event: KeyboardEvent) => {
+      if (
+        event.defaultPrevented ||
+        event.altKey ||
+        event.shiftKey ||
+        (!event.ctrlKey && !event.metaKey) ||
+        event.key.toLowerCase() !== 'o'
+      ) {
+        return;
+      }
+      event.preventDefault();
+      void openFolder();
+    };
+    window.addEventListener('keydown', handleShortcut);
     void projectStore
       .listenForWorkspaceUpdates()
       .then((stop) => {
@@ -35,16 +54,16 @@
       .catch((error) => {
         console.error('Unable to listen for workspace updates', error);
       });
-    void invoke<AppInfo>('get_app_info')
-      .then((appInfo) => {
-        appName = appInfo.name;
-        document.title = `${appInfo.name} ${appInfo.version}`;
-      })
-      .catch((error) => {
-        console.error('Unable to load application information', error);
-      });
+    void applyAppInfo(
+      () => invoke<AppInfo>('get_app_info'),
+      (name) => (appName = name),
+      (title) => (document.title = title),
+    ).catch((error) => {
+      console.error('Unable to load application information', error);
+    });
     return () => {
       destroyed = true;
+      window.removeEventListener('keydown', handleShortcut);
       unlisten?.();
     };
   });
@@ -62,6 +81,8 @@
       <button
         type="button"
         disabled={$projectStore.status === 'loading'}
+        aria-keyshortcuts="Control+O Meta+O"
+        title="Open folder (Ctrl/Cmd+O)"
         onclick={openFolder}
       >
         {$projectStore.status === 'loading' ? 'Opening…' : 'Open Folder'}
