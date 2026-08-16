@@ -2,11 +2,11 @@
 
 Source: `src/lib/map/map-graph.test.mjs`.
 
-Vite-loads production TypeScript modules and exercises pure state, ELK layout, routing geometry, determinism, and performance.
+esbuild-loads production TypeScript modules and exercises pure state, ELK layout, routing geometry, determinism, and performance.
 
 ## Helpers and fixtures
 
-- `loadTypeScript(relativePath)` — Vite SSR module loader.
+- `loadTypeScript(relativePath)` — esbuild-based module loader.
 - controllable layout job `start()` / `cancel()` — cancellation oracle.
 - `nestedProject`, `syntheticProject`, `fanProject`, `document`, `link` — deterministic graph fixtures.
 - `event` — edge-trace event builder.

@@ -10,7 +10,7 @@ Parses headings, ordinary Markdown links, and supported wiki links; resolves int
 - `RawLink` — raw target plus syntax/source offsets.
 - `ParsedMarkdown` — visible title/headings/raw links.
 - `index_workspace_documents(root,project)` — one full parse/read pass plus one shared resolution index.
-- `refresh_document_index(root,project,documentId)` — reparses one document and recomputes affected resolution.
+- `refresh_document_index(project,documentPath,content,workspaceGeneration)` — reparses one document from already-loaded content and recomputes affected resolution; returns a `Result<DocumentIndexUpdate, String>`.
 - `replace_document_index(...)` — installs metadata/source links and re-resolves canonically.
 - `filename_title(filename)` — Unicode-safe `.md` stem fallback.
 - `parse_markdown(content)` — two-pass pulldown-cmark parse: headings/ordinary ranges, then wiki events; suppresses nested/code/image/unsupported syntax.

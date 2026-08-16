@@ -23,7 +23,7 @@ Generation-bound native recursive filesystem watcher. Debounces/coalesces raw ev
 - `remove_path(project,relative)` — removes matching document/folder subtree.
 - `rebuild_hierarchy(project)` — recomputes ordered child/document lists.
 - `reindex_path(root,project,path,generation)` — refreshes changed document metadata/links.
-- `diff_project(before,after,generation,revision,externallyChanged)` — compact canonical `WorkspacePatch`.
+- `diff_project(before,after,generation,externallyChangedDocumentIds)` — compact canonical `WorkspacePatch`; revision is set by the caller afterward.
 - `is_markdown(path)`, `first_symlink_component(root,relative)`, `parent_path(path)`, `folder_id(path)`, `document_id(path)` — policy/identity helpers.
 
 ## Tests

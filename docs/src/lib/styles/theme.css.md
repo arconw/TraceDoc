@@ -19,5 +19,7 @@ Global dark semantic token set and document defaults.
 - `html`, `body`, `#app` fill the webview and prevent outer scrolling.
 - Controls inherit font/color.
 - `body` uses semantic background/foreground and system stack.
+- `body.resizing-sidebar` forces `col-resize` cursor and disables selection during sidebar drag.
+- `@media (forced-colors: active)` pins `:focus-visible` outline color to `Highlight`.
 
 Consumers: every Svelte component. Contrast is gated by [`theme-contrast.test`](theme-contrast.test.mjs.md).

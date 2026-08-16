@@ -27,6 +27,6 @@ Pure reducers for trace priority, layout result gating, and single-flight/deferr
 - `beginQueuedMapLayout(state)` — promotes pending signature.
 - `completeQueuedMapLayout(state)` — clears running.
 - `cancelQueuedMapLayout(state)` — invalidates active running work.
-- `retryQueuedMapLayout(state)` — requeues the last failed signature.
+- `retryQueuedMapLayout(state)` — requeues the active signature as pending when not currently running.
 
 Consumer: [`MapView`](../views/MapView.svelte.md).

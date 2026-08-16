@@ -19,7 +19,7 @@ CodeMirror syntax-tree integration. Decorates only visible Markdown ranges and p
 - `EmphasisLayer` — parsed bold/italic content and marker ranges.
 - `emphasisLayers(state, from, to)` — discovers enclosing parsed emphasis layers and actual marker text.
 - `layerMatches(layer, from, to)` — matches full or semantic selection to a layer.
-- `removeLayer(layer, selection)` — removes only the selected parsed layer and maps selection.
+- `removeLayer(range, layer)` — removes only the selected parsed layer and maps selection.
 - `mapPosition(position)` — maps positions through marker removal edits.
 - `blockAt(state, position, side)` — resolves the nearest syntax block.
 - `staysInOneInlineBlock(state, from, to)` — rejects cross-block formatting.
@@ -28,7 +28,7 @@ CodeMirror syntax-tree integration. Decorates only visible Markdown ranges and p
 - `markerBoundaryWithoutLayer(...)` — detects asymmetric parsed boundaries.
 - `escapedAdjacentPair(...)` — protects escaped pseudo-markers.
 - `intersectsStructuralSyntax(...)` — blocks edits through headings, lists, quotes, code, link destinations/titles/references, and escapes; cursor membership is half-open.
-- `toggleMarkdownMarker(marker)` — CodeMirror `StateCommand`; removes matching parsed layer before structural guards, otherwise applies [`markdownToggle`](markdown-editing.ts.md) to all selections in one isolated undo transaction.
+- `toggleMarkdownMarker(marker)` — CodeMirror `Command`; removes matching parsed layer before structural guards, otherwise applies [`markdownToggle`](markdown-editing.ts.md) to all selections in one isolated undo transaction.
 - `richMarkdownEditing` — exported extension combining decoration plugin and Mod-B/Mod-I keymap.
 
 Invariant: presentation never mutates Markdown; formatting emits one atomic transaction and preserves multi-selection direction.
