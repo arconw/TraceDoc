@@ -11,7 +11,7 @@ use std::{
     ffi::OsStr,
     fs,
     path::{Path, PathBuf},
-    sync::{mpsc, Mutex},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -39,45 +39,263 @@ struct PendingChange {
     reindex_existing: bool,
 }
 
-#[derive(Default)]
-pub struct WorkspaceWatcher {
-    active: Mutex<Option<RecommendedWatcher>>,
+/// Registers native recursive filesystem watches. Installation of the
+/// resulting watcher into a workspace session is arbitrated entirely by
+/// `WorkspaceSession::install_watcher`, under the same lock that guards
+/// `generation`/`workspace`, so this type carries no state of its own: two
+/// overlapping `arm`/`finish` pairs never contend over which watcher "is
+/// active" here - only the session's generation compare-and-set decides
+/// that.
+#[derive(Clone, Copy, Default)]
+pub struct WorkspaceWatcher;
+
+/// A native watch that has been registered with the OS but is not yet
+/// delivering events to a session. Returned by `WorkspaceWatcher::arm` and
+/// consumed by `WorkspaceWatcher::finish`.
+///
+/// `root_identity` is the filesystem-object identity observed for the
+/// watched root at the moment `arm` registered the watch, kept so `finish`
+/// can detect the narrow race where a different directory has since been
+/// moved into that same path (see `WorkspaceWatcher::finish`).
+pub struct ArmedWatcher {
+    watcher: RecommendedWatcher,
+    receiver: mpsc::Receiver<notify::Result<Event>>,
+    root_identity: Option<RootIdentity>,
 }
 
 impl WorkspaceWatcher {
-    pub fn start(
-        &self,
-        app: AppHandle,
-        session: crate::services::document::WorkspaceSession,
-        root: PathBuf,
-        generation: u64,
-    ) -> Result<(), String> {
-        self.active
-            .lock()
-            .map_err(|_| "The workspace watcher is unavailable".to_owned())?
-            .take();
+    /// Registers the native recursive filesystem watch for `root` and starts
+    /// buffering its events immediately - *before* the workspace is scanned -
+    /// so a file created, modified, or removed while the scan is still
+    /// running is queued here rather than silently missed.
+    ///
+    /// Deliberately does *not* touch whatever watcher is currently installed
+    /// on any active session: if the scan that follows (or activation of its
+    /// result) fails, the caller simply drops the returned `ArmedWatcher`
+    /// and the previously active workspace - if any - keeps its own watcher
+    /// and live updates uninterrupted. Only a *successful*
+    /// `WorkspaceSession::activate` followed by `finish` ever retires a
+    /// previous watcher.
+    pub fn arm(&self, root: &Path) -> Result<ArmedWatcher, String> {
         let (sender, receiver) = mpsc::channel();
         let mut watcher = notify::recommended_watcher(move |event| {
             let _ = sender.send(event);
         })
         .map_err(|error| format!("Unable to create workspace watcher: {error}"))?;
         watcher
-            .watch(&root, RecursiveMode::Recursive)
+            .watch(root, RecursiveMode::Recursive)
             .map_err(|error| format!("Unable to watch workspace: {error}"))?;
+        let root_identity = capture_root_identity(root);
+        Ok(ArmedWatcher {
+            watcher,
+            receiver,
+            root_identity,
+        })
+    }
+
+    /// Drains any changes (and errors) buffered by `arm` while the scan was
+    /// running, installs the watcher into `session` gated on `generation`
+    /// still being the session's current generation, folds the buffered
+    /// changes in through the same incremental reconciliation path used for
+    /// live events, and begins normal debounced event delivery for
+    /// subsequent changes.
+    ///
+    /// If a newer `open_workspace` request has already activated a later
+    /// generation by the time this runs - the two overlapping requests race
+    /// described by the P1 finding - installation is rejected atomically
+    /// with the generation check: this watcher is torn down (its buffered
+    /// changes and errors discarded) without touching whatever the newer
+    /// request installed. The caller's subsequent `session.snapshot(generation)`
+    /// call surfaces that loss to the (stale) caller authoritatively.
+    ///
+    /// Before any of that, revalidates that `root`'s filesystem-object
+    /// identity still matches what `arm` observed when it registered the
+    /// watch. Path-based watch backends (Linux inotify in particular) stay
+    /// bound to the object they resolved `root` to at `watch(2)` time, not
+    /// to whatever the path currently names; if something external renamed
+    /// that object away and moved a different one into `root`'s path while
+    /// the scan was running, `armed` is silently watching the wrong,
+    /// vanished directory while the scan (path-based, so it reads whatever
+    /// is at `root` right now) already picked up the replacement. When a
+    /// mismatch is detected, `armed` is discarded and a fresh watch is
+    /// armed on `root` in its place before draining/installing proceeds, so
+    /// the watcher that ends up installed tracks the replacement directory
+    /// the session just activated.
+    ///
+    /// A re-arm alone only guarantees that *future* changes to the
+    /// replacement are observed; the `project` already activated for this
+    /// generation was scanned before the re-arm happened and can be stale
+    /// with respect to the replacement's actual contents (the replacement
+    /// directory can itself be swapped again, or edited, in the gap between
+    /// the original scan finishing and the re-arm above). So a successful
+    /// re-arm here also forces a full reconciliation of `root` into the
+    /// session (see `WorkspaceSession::refresh_workspace`) before this
+    /// returns, rather than leaving the activated snapshot to catch up only
+    /// through whatever live events arrive after the re-arm. This is a
+    /// narrow, low-probability race - it requires an external directory
+    /// swap at the exact canonical path during the scan window - not a
+    /// concern in ordinary single-writer use.
+    pub fn finish<R: tauri::Runtime>(
+        &self,
+        armed: ArmedWatcher,
+        root: &Path,
+        app: AppHandle<R>,
+        session: crate::services::document::WorkspaceSession,
+        generation: u64,
+    ) -> Result<(), String> {
+        let (armed, root_replaced) = self.revalidate_root_identity(armed, root);
+        let ArmedWatcher {
+            watcher, receiver, ..
+        } = armed;
+
+        let mut pending = Vec::new();
+        let mut buffered_errors = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            match event {
+                Ok(event) => pending.extend(normalize_event(event)),
+                Err(error) => buffered_errors.push(format!("Workspace watcher error: {error}")),
+            }
+        }
+
+        // Gate installation on the generation check first: a stale watcher
+        // (superseded by a newer, already-activated request) is torn down
+        // right here - along with everything buffered above - instead of
+        // silently displacing the watcher the newer request installed.
+        if session.install_watcher(generation, watcher).is_err() {
+            return Ok(());
+        }
+
+        if root_replaced {
+            // The root was re-armed onto a replacement directory above, so
+            // the events buffered by the fresh watch only cover the window
+            // after the re-arm. Rescan `root` in full and reconcile that
+            // into the session instead of applying `pending` incrementally,
+            // so the activated snapshot reflects the replacement's actual
+            // current contents rather than whatever the pre-re-arm scan
+            // happened to observe.
+            //
+            // Best-effort: if the workspace already moved on to a newer
+            // generation, or changed again mid-rescan, between the install
+            // above and here, `session.snapshot` (called by the caller
+            // right after this returns) will surface that authoritatively.
+            let _ = session.refresh_workspace(generation);
+        } else if !pending.is_empty() {
+            // Best-effort: if the workspace already moved on to a newer
+            // generation between the install above and here,
+            // `session.snapshot` (called by the caller right after this
+            // returns) will surface that authoritatively.
+            let _ = session.apply_external_changes(generation, &pending);
+        }
+
+        // The native backend can report errors (e.g. an overflow or a
+        // watched-subtree failure) while the initial scan is still running.
+        // Surface them the same way `watch_loop` does for live errors below,
+        // instead of letting them vanish along with a successful snapshot.
+        // Read the revision only after the reconciliation above so a
+        // buffered error alongside a nonempty patch is stamped with the
+        // revision the caller's own `session.snapshot` is about to observe.
+        for message in buffered_errors {
+            let workspace_revision = session.current_revision(generation).unwrap_or(0);
+            let _ = app.emit(
+                "workspace-watch-error",
+                WorkspaceEventError {
+                    workspace_generation: generation,
+                    workspace_revision,
+                    message,
+                },
+            );
+        }
 
         thread::spawn(move || watch_loop(receiver, app, session, generation));
-        let mut active = self
-            .active
-            .lock()
-            .map_err(|_| "The workspace watcher is unavailable".to_owned())?;
-        *active = Some(watcher);
         Ok(())
+    }
+
+    /// Returns `armed` unchanged (and reports no replacement) unless `root`'s
+    /// filesystem-object identity has diverged from the identity `arm`
+    /// captured for it, in which case `armed` is dropped and a fresh watch
+    /// is armed on `root` in its place. Best-effort: if identity cannot be
+    /// determined on either side (an unsupported platform, or a transient
+    /// stat failure), no divergence is assumed and `armed` is kept as-is,
+    /// matching pre-revalidation behavior. If re-arming fails, `armed` is
+    /// also kept as-is rather than leaving the workspace with no watcher at
+    /// all - and, since no fresh watch was actually armed, no replacement is
+    /// reported either.
+    ///
+    /// The returned `bool` tells `finish` whether a replacement watch was
+    /// armed, so it knows the already-activated `project` may be stale with
+    /// respect to the replacement directory's current contents and needs a
+    /// full reconciliation rather than an incremental one.
+    fn revalidate_root_identity(&self, armed: ArmedWatcher, root: &Path) -> (ArmedWatcher, bool) {
+        let diverged = armed
+            .root_identity
+            .zip(capture_root_identity(root))
+            .is_some_and(|(armed_identity, current_identity)| armed_identity != current_identity);
+        if !diverged {
+            return (armed, false);
+        }
+        match self.arm(root) {
+            Ok(fresh) => (fresh, true),
+            Err(_) => (armed, false),
+        }
     }
 }
 
-fn watch_loop(
+/// Opaque filesystem-object identity used to detect whether the directory
+/// backing a watched root's *path* has been swapped for a different
+/// directory. `(volume, file)` is `(device, inode)` on Unix and
+/// `(volume serial number, file index)` on Windows - the same identity
+/// pairs `services/document.rs` already relies on for its save-path
+/// revalidation, just captured for the workspace root instead of a
+/// document's save path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RootIdentity {
+    volume: u64,
+    file: u64,
+}
+
+#[cfg(unix)]
+fn capture_root_identity(root: &Path) -> Option<RootIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::metadata(root).ok()?;
+    Some(RootIdentity {
+        volume: metadata.dev(),
+        file: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn capture_root_identity(root: &Path) -> Option<RootIdentity> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(root)
+        .ok()?;
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut information) } == 0 {
+        return None;
+    }
+    Some(RootIdentity {
+        volume: u64::from(information.dwVolumeSerialNumber),
+        file: (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn capture_root_identity(_root: &Path) -> Option<RootIdentity> {
+    None
+}
+
+fn watch_loop<R: tauri::Runtime>(
     receiver: mpsc::Receiver<notify::Result<Event>>,
-    app: AppHandle,
+    app: AppHandle<R>,
     session: crate::services::document::WorkspaceSession,
     generation: u64,
 ) {
@@ -105,6 +323,31 @@ fn watch_loop(
             }
         }
 
+        if !changes.is_empty() {
+            match session.apply_external_changes(generation, &changes) {
+                Ok(Some(patch)) => {
+                    let _ = app.emit("workspace-patch", patch);
+                }
+                Ok(None) => {}
+                Err(error) if error.to_string().contains("workspace changed") => return,
+                Err(error) => {
+                    let workspace_revision = session.current_revision(generation).unwrap_or(0);
+                    let _ = app.emit(
+                        "workspace-watch-error",
+                        WorkspaceEventError {
+                            workspace_generation: generation,
+                            workspace_revision,
+                            message: error.to_string(),
+                        },
+                    );
+                }
+            }
+        }
+
+        // Read the revision only after the reconciliation above so a
+        // watcher error batched alongside a nonempty patch is stamped with
+        // the revision the patch (if any) just advanced to, not the value
+        // that was current before it.
         if let Some(message) = error_message {
             let workspace_revision = session.current_revision(generation).unwrap_or(0);
             let _ = app.emit(
@@ -115,27 +358,6 @@ fn watch_loop(
                     message,
                 },
             );
-        }
-        if changes.is_empty() {
-            continue;
-        }
-        match session.apply_external_changes(generation, &changes) {
-            Ok(Some(patch)) => {
-                let _ = app.emit("workspace-patch", patch);
-            }
-            Ok(None) => {}
-            Err(error) if error.to_string().contains("workspace changed") => return,
-            Err(error) => {
-                let workspace_revision = session.current_revision(generation).unwrap_or(0);
-                let _ = app.emit(
-                    "workspace-watch-error",
-                    WorkspaceEventError {
-                        workspace_generation: generation,
-                        workspace_revision,
-                        message: error.to_string(),
-                    },
-                );
-            }
         }
     }
 }
@@ -937,6 +1159,470 @@ mod tests {
         assert!(observed, "native watcher should report the created file");
     }
 
+    #[test]
+    fn reconciles_changes_made_between_arming_the_watcher_and_the_initial_scan() {
+        use crate::services::document::WorkspaceSession;
+
+        let workspace = TestWorkspace::new();
+        fs::write(workspace.path().join("page.md"), "# Page").expect("page should be written");
+        fs::write(workspace.path().join("stale.md"), "# Stale")
+            .expect("stale file should be written");
+
+        let watcher = super::WorkspaceWatcher;
+        let armed = watcher.arm(workspace.path()).expect("watcher should arm");
+
+        // This scan stands in for the initial `open_workspace` scan, which in
+        // production now always runs *after* the watch has been armed above.
+        let baseline = scan_workspace(workspace.path()).expect("workspace should scan");
+        assert!(baseline.documents.contains_key("document:page.md"));
+        assert!(baseline.documents.contains_key("document:stale.md"));
+        assert!(!baseline.documents.contains_key("document:added.md"));
+
+        // Mutate the workspace after the scan has already produced its
+        // snapshot, i.e. exactly the race the P1 regression described: a
+        // create, a modify, and a delete that the scan can no longer see.
+        fs::write(workspace.path().join("added.md"), "# Added")
+            .expect("a file created during the scan window should be written");
+        fs::write(workspace.path().join("page.md"), "# Changed")
+            .expect("a file modified during the scan window should be written");
+        fs::remove_file(workspace.path().join("stale.md"))
+            .expect("a file removed during the scan window should be removed");
+
+        // Give the native watcher, armed before the scan started, a moment
+        // to actually deliver these events into its channel.
+        std::thread::sleep(Duration::from_millis(750));
+
+        let session = WorkspaceSession::default();
+        let generation = session
+            .activate(workspace.path().to_path_buf(), baseline)
+            .expect("workspace session should activate");
+
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        watcher
+            .finish(armed, workspace.path(), handle, session.clone(), generation)
+            .expect("watcher should finish arming");
+
+        let snapshot = session
+            .snapshot(generation)
+            .expect("the activated snapshot should be readable");
+
+        assert!(
+            snapshot.project.documents.contains_key("document:added.md"),
+            "a file created during the scan window must not be lost until a manual refresh"
+        );
+        assert!(
+            !snapshot.project.documents.contains_key("document:stale.md"),
+            "a file removed during the scan window must not linger until a manual refresh"
+        );
+        assert_eq!(
+            snapshot.project.documents["document:page.md"]
+                .title
+                .as_deref(),
+            Some("Changed"),
+            "a file modified during the scan window must be reconciled without a manual refresh"
+        );
+    }
+
+    #[test]
+    fn a_slow_stale_finish_does_not_disturb_a_faster_winning_watcher() {
+        use crate::services::document::WorkspaceSession;
+
+        // Simulates two overlapping `open_workspace` requests (the P1
+        // regression): an earlier request (`a`) whose `finish` is delayed -
+        // e.g. by scheduling on a busy blocking thread pool - until after a
+        // later request (`b`) has already activated and finished installing
+        // its own watcher. The earlier request's belated `finish` must not
+        // be allowed to replace `b`'s live watcher; if it did, `b`'s watch
+        // loop would lose its native watch and stop observing filesystem
+        // changes even though `b` remains the active workspace.
+        let workspace_a = TestWorkspace::new();
+        let workspace_b = TestWorkspace::new();
+        fs::write(workspace_a.path().join("only-a.md"), "# A")
+            .expect("a's page should be written");
+        fs::write(workspace_b.path().join("only-b.md"), "# B")
+            .expect("b's page should be written");
+
+        let watcher = super::WorkspaceWatcher;
+        let armed_a = watcher.arm(workspace_a.path()).expect("a should arm");
+        let project_a = scan_workspace(workspace_a.path()).expect("a should scan");
+        let armed_b = watcher.arm(workspace_b.path()).expect("b should arm");
+        let project_b = scan_workspace(workspace_b.path()).expect("b should scan");
+
+        let session = WorkspaceSession::default();
+        let generation_a = session
+            .activate(workspace_a.path().to_path_buf(), project_a)
+            .expect("a should activate");
+        let generation_b = session
+            .activate(workspace_b.path().to_path_buf(), project_b)
+            .expect("b should activate");
+        assert!(generation_b > generation_a);
+
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+
+        // `b`, the later/winning request, finishes first.
+        watcher
+            .finish(
+                armed_b,
+                workspace_b.path(),
+                handle.clone(),
+                session.clone(),
+                generation_b,
+            )
+            .expect("b should finish");
+        // `a`'s belated finish arrives after `b` has already won.
+        watcher
+            .finish(
+                armed_a,
+                workspace_a.path(),
+                handle,
+                session.clone(),
+                generation_a,
+            )
+            .expect("a's stale finish should be a benign no-op");
+
+        // `a` is stale and must be reported as such...
+        assert!(session.snapshot(generation_a).is_err());
+        // ...while `b` must remain the live, correctly populated workspace.
+        let snapshot = session
+            .snapshot(generation_b)
+            .expect("b should remain the active workspace");
+        assert!(snapshot.project.documents.contains_key("document:only-b.md"));
+
+        // The decisive check: b's native watcher must still be delivering
+        // live events. Under the pre-fix behavior, `a`'s stale `finish`
+        // replaced the single shared "active" watcher slot with its own
+        // (already-superseded) watcher, which tore down `b`'s OS-level
+        // watch and disconnected its `watch_loop`.
+        fs::write(workspace_b.path().join("live.md"), "# Live")
+            .expect("a new file should be written to b's workspace");
+        let observed = (0..40).any(|_| {
+            std::thread::sleep(Duration::from_millis(75));
+            session
+                .snapshot(generation_b)
+                .map(|snapshot| snapshot.project.documents.contains_key("document:live.md"))
+                .unwrap_or(false)
+        });
+        assert!(
+            observed,
+            "b's watcher must still be live after a's stale finish"
+        );
+    }
+
+    #[test]
+    fn a_failed_reopen_does_not_disturb_the_existing_active_watcher() {
+        use crate::services::document::WorkspaceSession;
+
+        // Simulates opening a second workspace whose scan (or activation)
+        // fails after the watcher has already been armed (the P2 "keep the
+        // current watcher" regression). Before this fix, `arm` unconditionally
+        // tore down whatever watcher was previously installed the moment it
+        // was called, so a failed reopen silently killed the existing
+        // workspace's live updates even though that existing workspace
+        // never stopped being the active one.
+        let existing = TestWorkspace::new();
+        fs::write(existing.path().join("page.md"), "# Page").expect("page should be written");
+        let attempted = TestWorkspace::new();
+
+        let watcher = super::WorkspaceWatcher;
+        let session = WorkspaceSession::default();
+
+        let armed_existing = watcher.arm(existing.path()).expect("existing should arm");
+        let project_existing = scan_workspace(existing.path()).expect("existing should scan");
+        let generation_existing = session
+            .activate(existing.path().to_path_buf(), project_existing)
+            .expect("existing should activate");
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        watcher
+            .finish(
+                armed_existing,
+                existing.path(),
+                handle,
+                session.clone(),
+                generation_existing,
+            )
+            .expect("existing should finish");
+
+        // Arm a second watch for a would-be reopen, then simulate its scan
+        // (or activation) failing by simply dropping the armed watcher
+        // without ever calling `activate`/`finish` for it - exactly what
+        // the real `open_workspace` command does when `scan_canonical_root`
+        // returns an error after `arm` has already succeeded.
+        let armed_attempt = watcher.arm(attempted.path()).expect("attempt should arm");
+        drop(armed_attempt);
+
+        // The pre-existing workspace's watcher must still be alive.
+        fs::write(existing.path().join("live.md"), "# Live")
+            .expect("a new file should be written to the existing workspace");
+        let observed = (0..40).any(|_| {
+            std::thread::sleep(Duration::from_millis(75));
+            session
+                .snapshot(generation_existing)
+                .map(|snapshot| snapshot.project.documents.contains_key("document:live.md"))
+                .unwrap_or(false)
+        });
+        assert!(
+            observed,
+            "the existing workspace's watcher must survive a failed reopen attempt"
+        );
+    }
+
+    #[test]
+    fn buffered_watcher_errors_from_the_scan_window_reach_workspace_watch_error() {
+        use crate::services::document::WorkspaceSession;
+        use std::sync::{Arc, Mutex};
+        use tauri::Listener;
+
+        // Simulates the native backend (e.g. inotify) reporting an error -
+        // such as an overflow - while the initial scan is still running,
+        // i.e. before `finish` has a chance to drain the buffered channel
+        // (the P2 "preserve buffered errors" regression). These errors must
+        // reach the same `workspace-watch-error` notification the normal
+        // `watch_loop` emits for live errors, not be silently dropped
+        // alongside an apparently-successful snapshot.
+        let workspace = TestWorkspace::new();
+        fs::write(workspace.path().join("page.md"), "# Page").expect("page should be written");
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let injector = sender.clone();
+        let mut native = notify::recommended_watcher(move |event| {
+            let _ = sender.send(event);
+        })
+        .expect("native watcher should initialize");
+        native
+            .watch(workspace.path(), RecursiveMode::Recursive)
+            .expect("fixture should be watched");
+        injector
+            .send(Err(notify::Error::generic("synthetic overflow")))
+            .expect("the synthetic error should buffer");
+        let armed = super::ArmedWatcher {
+            watcher: native,
+            receiver,
+            root_identity: None,
+        };
+
+        let project = scan_workspace(workspace.path()).expect("workspace should scan");
+        let session = WorkspaceSession::default();
+        let generation = session
+            .activate(workspace.path().to_path_buf(), project)
+            .expect("workspace should activate");
+
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let collector = received.clone();
+        handle.listen("workspace-watch-error", move |event| {
+            collector
+                .lock()
+                .expect("lock should not be poisoned")
+                .push(event.payload().to_owned());
+        });
+
+        let watcher = super::WorkspaceWatcher;
+        watcher
+            .finish(armed, workspace.path(), handle, session.clone(), generation)
+            .expect("finish should succeed despite the buffered error");
+
+        let payloads = received.lock().expect("lock should not be poisoned");
+        assert_eq!(
+            payloads.len(),
+            1,
+            "the buffered error should reach exactly one notification, not be dropped"
+        );
+        assert!(payloads[0].contains("synthetic overflow"));
+        assert!(payloads[0].contains(&generation.to_string()));
+    }
+
+    #[test]
+    fn buffered_watcher_errors_paired_with_a_nonempty_patch_are_stamped_with_the_post_reconciliation_revision(
+    ) {
+        use crate::services::document::WorkspaceSession;
+        use std::sync::{Arc, Mutex};
+        use tauri::Listener;
+
+        // The P2 "stamp buffered errors after reconciliation" regression: a
+        // scan-window error buffered alongside a scan-window filesystem
+        // change that produces a nonempty patch. `finish` must not emit the
+        // error with the pre-reconciliation revision - `apply_external_changes`
+        // below bumps the revision past it, and `applyWorkspaceError` in
+        // `project-state.ts` discards any error whose revision is older
+        // than the workspace's current revision as stale.
+        let workspace = TestWorkspace::new();
+        fs::write(workspace.path().join("page.md"), "# Page").expect("page should be written");
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let injector = sender.clone();
+        let mut native = notify::recommended_watcher(move |event| {
+            let _ = sender.send(event);
+        })
+        .expect("native watcher should initialize");
+        native
+            .watch(workspace.path(), RecursiveMode::Recursive)
+            .expect("fixture should be watched");
+
+        let project = scan_workspace(workspace.path()).expect("workspace should scan");
+
+        fs::write(workspace.path().join("added.md"), "# Added")
+            .expect("a file created during the scan window should be written");
+        std::thread::sleep(Duration::from_millis(750));
+
+        injector
+            .send(Err(notify::Error::generic("synthetic overflow")))
+            .expect("the synthetic error should buffer alongside the real change above");
+
+        let armed = super::ArmedWatcher {
+            watcher: native,
+            receiver,
+            root_identity: None,
+        };
+
+        let session = WorkspaceSession::default();
+        let generation = session
+            .activate(workspace.path().to_path_buf(), project)
+            .expect("workspace should activate");
+
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let collector = received.clone();
+        handle.listen("workspace-watch-error", move |event| {
+            collector
+                .lock()
+                .expect("lock should not be poisoned")
+                .push(event.payload().to_owned());
+        });
+
+        let watcher = super::WorkspaceWatcher;
+        watcher
+            .finish(armed, workspace.path(), handle, session.clone(), generation)
+            .expect("finish should succeed despite the buffered error");
+
+        let snapshot = session
+            .snapshot(generation)
+            .expect("the activated snapshot should be readable");
+        assert!(
+            snapshot.project.documents.contains_key("document:added.md"),
+            "the scan-window change must still be reconciled"
+        );
+        assert_eq!(
+            snapshot.workspace_revision, 2,
+            "a nonempty patch produced during finish must bump the revision past its \
+             pre-reconciliation value, or this test cannot distinguish the two revisions"
+        );
+
+        let payloads = received.lock().expect("lock should not be poisoned");
+        assert_eq!(
+            payloads.len(),
+            1,
+            "the buffered error should reach exactly one notification, not be dropped"
+        );
+        assert!(payloads[0].contains("synthetic overflow"));
+        let post_reconciliation_marker =
+            format!("\"workspaceRevision\":{}", snapshot.workspace_revision);
+        assert!(
+            payloads[0].contains(&post_reconciliation_marker),
+            "the emitted error must carry the post-reconciliation revision {} so \
+             applyWorkspaceError does not discard it as stale: {}",
+            snapshot.workspace_revision,
+            payloads[0]
+        );
+    }
+
+    #[test]
+    fn watch_loop_stamps_a_live_batch_error_with_the_post_reconciliation_revision_when_paired_with_a_nonempty_patch(
+    ) {
+        use crate::services::document::WorkspaceSession;
+        use std::sync::{Arc, Mutex};
+        use tauri::Listener;
+
+        // The same ordering hazard as `finish`'s P2 regression, but for a
+        // live batch: `watch_loop`'s own debounce window can coalesce a
+        // watcher error together with a real filesystem change into one
+        // batch. Stamping the error before `apply_external_changes` bumps
+        // the revision would make `applyWorkspaceError` in
+        // `project-state.ts` discard it as stale the moment the
+        // accompanying patch lands.
+        let workspace = TestWorkspace::new();
+        fs::write(workspace.path().join("page.md"), "# Page").expect("page should be written");
+        let project = scan_workspace(workspace.path()).expect("workspace should scan");
+
+        let session = WorkspaceSession::default();
+        let generation = session
+            .activate(workspace.path().to_path_buf(), project)
+            .expect("workspace should activate");
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let injector = sender.clone();
+        let mut native = notify::recommended_watcher(move |event| {
+            let _ = sender.send(event);
+        })
+        .expect("native watcher should initialize");
+        native
+            .watch(workspace.path(), RecursiveMode::Recursive)
+            .expect("fixture should be watched");
+
+        fs::write(workspace.path().join("added.md"), "# Added")
+            .expect("a live file creation should be written");
+        std::thread::sleep(Duration::from_millis(750));
+        injector
+            .send(Err(notify::Error::generic("synthetic overflow")))
+            .expect("the synthetic error should batch alongside the real change above");
+
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let collector = received.clone();
+        handle.listen("workspace-watch-error", move |event| {
+            collector
+                .lock()
+                .expect("lock should not be poisoned")
+                .push(event.payload().to_owned());
+        });
+
+        let loop_session = session.clone();
+        let loop_handle = handle.clone();
+        std::thread::spawn(move || super::watch_loop(receiver, loop_handle, loop_session, generation));
+
+        let snapshot = (0..40)
+            .find_map(|_| {
+                std::thread::sleep(Duration::from_millis(75));
+                session.snapshot(generation).ok().filter(|snapshot| {
+                    snapshot.project.documents.contains_key("document:added.md")
+                })
+            })
+            .expect("the live batch's change must be reconciled");
+        assert_eq!(
+            snapshot.workspace_revision, 2,
+            "a nonempty patch from a live batch must bump the revision past its \
+             pre-reconciliation value, or this test cannot distinguish the two revisions"
+        );
+
+        let payloads = (0..40)
+            .find_map(|_| {
+                std::thread::sleep(Duration::from_millis(75));
+                let payloads = received.lock().expect("lock should not be poisoned");
+                (!payloads.is_empty()).then(|| payloads.clone())
+            })
+            .expect("the buffered live error must reach a notification");
+        assert_eq!(
+            payloads.len(),
+            1,
+            "the buffered live error should reach exactly one notification, not be dropped"
+        );
+        assert!(payloads[0].contains("synthetic overflow"));
+        let post_reconciliation_marker =
+            format!("\"workspaceRevision\":{}", snapshot.workspace_revision);
+        assert!(
+            payloads[0].contains(&post_reconciliation_marker),
+            "the emitted live error must carry the post-reconciliation revision {} so \
+             applyWorkspaceError does not discard it as stale: {}",
+            snapshot.workspace_revision,
+            payloads[0]
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn incremental_reconcile_does_not_follow_symlink_components() {
@@ -966,5 +1652,151 @@ mod tests {
             project,
             scan_workspace(workspace.path()).expect("symlink policy should match full scan")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finish_re_arms_when_the_watched_root_is_replaced_at_the_same_path_during_the_scan_window() {
+        use crate::services::document::WorkspaceSession;
+
+        // Narrow edge case (low-probability, not ordinary use): between
+        // `arm` registering the native watch and `finish` installing it,
+        // something external renames the watched directory away and moves
+        // a *different* directory into that exact canonical path. Linux
+        // inotify stays bound to the object it originally resolved `root`
+        // to, not to whatever the path names now, so without revalidation
+        // the installed watcher would silently keep watching the
+        // renamed-away, no-longer-reachable original while the scan (and
+        // the session it activates) already read the replacement. This
+        // requires an external directory swap at the exact canonical path
+        // during the scan window and is unlikely outside adversarial or
+        // heavily scripted environments.
+        let workspace = TestWorkspace::new();
+        let root = workspace.path().to_path_buf();
+        fs::write(root.join("old.md"), "# Old").expect("original file should be written");
+
+        let watcher = super::WorkspaceWatcher;
+        let armed = watcher
+            .arm(&root)
+            .expect("watcher should arm on the original directory");
+
+        let displaced = root.with_file_name(format!(
+            "{}-displaced",
+            root.file_name()
+                .expect("fixture root should have a name")
+                .to_string_lossy()
+        ));
+        fs::rename(&root, &displaced).expect("the original directory should be renamed away");
+        fs::create_dir_all(&root)
+            .expect("a replacement directory should be created at the same path");
+        fs::write(root.join("new.md"), "# New").expect("the replacement file should be written");
+
+        let project = scan_workspace(&root).expect("scan should read the replacement directory");
+        assert!(project.documents.contains_key("document:new.md"));
+        assert!(!project.documents.contains_key("document:old.md"));
+
+        let session = WorkspaceSession::default();
+        let generation = session
+            .activate(root.clone(), project)
+            .expect("workspace should activate");
+
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        watcher
+            .finish(armed, &root, handle, session.clone(), generation)
+            .expect("finish should re-arm on the replacement directory");
+
+        fs::write(root.join("live.md"), "# Live")
+            .expect("a live file should be written to the replacement directory");
+        let observed = (0..40).any(|_| {
+            std::thread::sleep(Duration::from_millis(75));
+            session
+                .snapshot(generation)
+                .map(|snapshot| snapshot.project.documents.contains_key("document:live.md"))
+                .unwrap_or(false)
+        });
+        assert!(
+            observed,
+            "the watcher must track the replacement directory living at root's path, \
+             not the renamed-away original it was armed on"
+        );
+
+        let _ = fs::remove_dir_all(&displaced);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finish_reconciles_the_replacement_directory_when_it_changes_again_before_the_re_arm() {
+        use crate::services::document::WorkspaceSession;
+
+        // Same narrow edge case as the sibling test above, but the
+        // replacement directory is mutated again *after* the pre-activation
+        // scan already read it and *before* `finish`'s re-arm runs. A
+        // re-arm alone only starts observing changes from the moment it
+        // runs forward - it cannot retroactively see a change that already
+        // happened before it - so without reconciling the replacement's
+        // actual current contents after re-arming, this change would be
+        // lost until a manual refresh.
+        let workspace = TestWorkspace::new();
+        let root = workspace.path().to_path_buf();
+        fs::write(root.join("old.md"), "# Old").expect("original file should be written");
+
+        let watcher = super::WorkspaceWatcher;
+        let armed = watcher
+            .arm(&root)
+            .expect("watcher should arm on the original directory");
+
+        let displaced = root.with_file_name(format!(
+            "{}-displaced",
+            root.file_name()
+                .expect("fixture root should have a name")
+                .to_string_lossy()
+        ));
+        fs::rename(&root, &displaced).expect("the original directory should be renamed away");
+        fs::create_dir_all(&root)
+            .expect("a replacement directory should be created at the same path");
+        fs::write(root.join("new.md"), "# New").expect("the replacement file should be written");
+
+        // This scan stands in for the scan that runs between `arm` and
+        // `activate` in production; it reads the replacement directory as
+        // it stands right now, before it changes again below.
+        let project = scan_workspace(&root).expect("scan should read the replacement directory");
+        assert!(project.documents.contains_key("document:new.md"));
+        assert!(!project
+            .documents
+            .contains_key("document:added-after-scan.md"));
+
+        let session = WorkspaceSession::default();
+        let generation = session
+            .activate(root.clone(), project)
+            .expect("workspace should activate");
+
+        // The replacement directory changes again after the scan above
+        // already produced the activated `project`, but before `finish`
+        // (and the re-arm inside it) runs.
+        fs::write(root.join("added-after-scan.md"), "# Added after scan")
+            .expect("a file added after the scan but before finish should be written");
+
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        watcher
+            .finish(armed, &root, handle, session.clone(), generation)
+            .expect("finish should re-arm and reconcile the replacement directory");
+
+        let snapshot = session
+            .snapshot(generation)
+            .expect("the activated snapshot should be readable");
+        assert!(
+            snapshot
+                .project
+                .documents
+                .contains_key("document:added-after-scan.md"),
+            "a change made to the replacement directory between the scan and finish's \
+             re-arm must be reconciled by finish, not left stale until a manual refresh"
+        );
+        assert!(snapshot.project.documents.contains_key("document:new.md"));
+        assert!(!snapshot.project.documents.contains_key("document:old.md"));
+
+        let _ = fs::remove_dir_all(&displaced);
     }
 }

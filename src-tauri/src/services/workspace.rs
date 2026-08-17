@@ -45,6 +45,16 @@ impl fmt::Display for WorkspaceError {
 impl std::error::Error for WorkspaceError {}
 
 pub fn scan_workspace(root: &Path) -> Result<ProjectModel, WorkspaceError> {
+    let canonical_root = resolve_workspace_root(root)?;
+    scan_canonical_root(canonical_root)
+}
+
+/// Validates that `root` exists and is a directory, then resolves it to its
+/// canonical form. Split out of `scan_workspace` so a caller that needs to
+/// register a filesystem watch on the canonical root *before* walking the
+/// tree (closing the scan-to-watch race window) can do so between resolution
+/// and the scan itself.
+pub(crate) fn resolve_workspace_root(root: &Path) -> Result<PathBuf, WorkspaceError> {
     let supplied_root = root
         .to_str()
         .filter(|path| !path.is_empty())
@@ -58,10 +68,14 @@ pub fn scan_workspace(root: &Path) -> Result<ProjectModel, WorkspaceError> {
         return Err(WorkspaceError::NotDirectory(supplied_root.to_owned()));
     }
 
-    let root = fs::canonicalize(root).map_err(|source| WorkspaceError::RootUnavailable {
+    fs::canonicalize(root).map_err(|source| WorkspaceError::RootUnavailable {
         path: supplied_root.to_owned(),
         source,
-    })?;
+    })
+}
+
+/// Recursively scans an already-canonical root. See `resolve_workspace_root`.
+pub(crate) fn scan_canonical_root(root: PathBuf) -> Result<ProjectModel, WorkspaceError> {
     let root_path = normalize_root_path(&root);
     let root_name = root
         .file_name()

@@ -5,9 +5,13 @@ use crate::{
     services::{
         markdown::refresh_document_index,
         watcher::{apply_project_changes, diff_project, WorkspaceChange},
-        workspace::{normalize_relative_path, scan_workspace, WorkspaceError},
+        workspace::{
+            normalize_relative_path, resolve_workspace_root, scan_canonical_root, scan_workspace,
+            WorkspaceError,
+        },
     },
 };
+use notify::RecommendedWatcher;
 use std::{
     collections::{BTreeSet, VecDeque},
     fmt, fs,
@@ -42,6 +46,16 @@ struct ActiveWorkspace {
     self_writes: std::collections::BTreeMap<String, SelfWrite>,
     revision: u64,
     history: VecDeque<WorkspacePatch>,
+    /// The native watcher currently delivering live updates for this
+    /// workspace, if `WorkspaceWatcher::finish` has installed one yet.
+    /// Kept inside the same lock-protected state as `generation`/`root` so
+    /// that installing a new watcher can be gated atomically on the
+    /// generation still being current (see `install_watcher`), and so that
+    /// activating a *new* workspace - which replaces this struct wholesale -
+    /// is the only thing that ever retires this watcher. A scan or
+    /// activation that fails for a *new* root never reaches that point, so
+    /// this watcher (and this workspace's live updates) is left untouched.
+    watcher: Option<RecommendedWatcher>,
 }
 
 struct SelfWrite {
@@ -91,8 +105,59 @@ impl WorkspaceSession {
             self_writes: std::collections::BTreeMap::new(),
             revision: 1,
             history: VecDeque::new(),
+            watcher: None,
         });
         Ok(state.generation)
+    }
+
+    /// Installs `watcher` as the live watcher for the workspace at
+    /// `expected_generation`, atomically with checking that generation is
+    /// still current. Rejects (and lets the caller tear down `watcher`)
+    /// without touching the session otherwise if a newer `activate` call has
+    /// already superseded `expected_generation` - this is what stops a
+    /// slow-to-`finish` `open_workspace` request from clobbering a faster,
+    /// later request's already-installed watcher.
+    ///
+    /// Because this shares the write lock with `activate`, there is no
+    /// window in which a concurrent `activate` can be observed to succeed
+    /// between this method's generation check and its install.
+    pub fn install_watcher(
+        &self,
+        expected_generation: u64,
+        watcher: RecommendedWatcher,
+    ) -> Result<(), DocumentError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| DocumentError::new("The workspace session is unavailable"))?;
+        if state.generation != expected_generation {
+            return Err(DocumentError::workspace_changed());
+        }
+        let workspace = state
+            .workspace
+            .as_mut()
+            .ok_or_else(|| DocumentError::new("No workspace is currently open"))?;
+        workspace.watcher = Some(watcher);
+        Ok(())
+    }
+
+    pub fn snapshot(&self, expected_generation: u64) -> Result<WorkspaceSnapshot, DocumentError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| DocumentError::new("The workspace session is unavailable"))?;
+        if state.generation != expected_generation {
+            return Err(DocumentError::workspace_changed());
+        }
+        let workspace = state
+            .workspace
+            .as_ref()
+            .ok_or_else(|| DocumentError::new("No workspace is currently open"))?;
+        Ok(WorkspaceSnapshot {
+            workspace_generation: expected_generation,
+            workspace_revision: workspace.revision,
+            project: workspace.project.clone(),
+        })
     }
 
     pub fn capture(&self, expected_generation: u64) -> Result<WorkspaceLease, DocumentError> {
@@ -416,12 +481,8 @@ impl std::error::Error for DocumentError {}
 pub fn open_workspace(
     root: &Path,
 ) -> Result<(crate::models::workspace::ProjectModel, PathBuf), WorkspaceError> {
-    let project = scan_workspace(root)?;
-    let canonical_root =
-        fs::canonicalize(root).map_err(|source| WorkspaceError::RootUnavailable {
-            path: root.to_string_lossy().into_owned(),
-            source,
-        })?;
+    let canonical_root = resolve_workspace_root(root)?;
+    let project = scan_canonical_root(canonical_root.clone())?;
     Ok((project, canonical_root))
 }
 
@@ -3656,6 +3717,46 @@ mod tests {
                 .expect("saved document should be readable"),
             "# Changed\n\n[[target]]"
         );
+    }
+
+    #[test]
+    fn open_workspace_pairs_a_canonical_root_with_the_scanned_project() {
+        let workspace = TestDirectory::new("open-workspace-pairing");
+        fs::write(workspace.path().join("page.md"), "# Page").expect("page should be written");
+        let missing = workspace.path().join("missing-child");
+
+        let (project, root) = open_workspace(workspace.path()).expect("workspace should open");
+
+        assert_eq!(
+            root,
+            fs::canonicalize(workspace.path()).expect("workspace root should canonicalize")
+        );
+        assert!(project.documents.contains_key("document:page.md"));
+        assert!(open_workspace(&missing).is_err());
+    }
+
+    #[test]
+    fn activating_a_workspace_returns_its_snapshot_without_rescanning_disk() {
+        let workspace = TestDirectory::new("activate-snapshot");
+        fs::write(workspace.path().join("page.md"), "# Page").expect("page should be written");
+        let (project, root) = open_workspace(workspace.path()).expect("workspace should open");
+        let session = WorkspaceSession::default();
+        let generation = session
+            .activate(root, project)
+            .expect("workspace session should activate");
+
+        fs::write(workspace.path().join("added.md"), "# Added")
+            .expect("an out-of-band document should be written after activation");
+
+        let snapshot = session
+            .snapshot(generation)
+            .expect("the active snapshot should be readable");
+
+        assert_eq!(snapshot.workspace_generation, generation);
+        assert_eq!(snapshot.workspace_revision, 1);
+        assert!(snapshot.project.documents.contains_key("document:page.md"));
+        assert!(!snapshot.project.documents.contains_key("document:added.md"));
+        assert!(session.snapshot(generation + 1).is_err());
     }
 
     #[test]
