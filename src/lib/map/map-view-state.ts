@@ -1,3 +1,5 @@
+import type { MapFlowEdge } from './elk-layout';
+
 export interface MapEdgeTraceState {
   pointerHoveredEdgeId: string | null;
   focusedEdgeId: string | null;
@@ -23,6 +25,86 @@ export function reduceMapEdgeTrace(
 
 export function effectiveMapEdgeTraceId(state: MapEdgeTraceState) {
   return state.pointerHoveredEdgeId ?? state.focusedEdgeId;
+}
+
+export function resolveTracedEdge(
+  state: MapEdgeTraceState,
+  documentTraceActive: boolean,
+  layoutEdges: readonly MapFlowEdge[],
+): MapFlowEdge | null {
+  if (documentTraceActive) return null;
+  const tracedEdgeId = effectiveMapEdgeTraceId(state);
+  if (!tracedEdgeId) return null;
+  return layoutEdges.find((edge) => edge.id === tracedEdgeId) ?? null;
+}
+
+export function clearMapEdgeTraceForDocument(
+  state: MapEdgeTraceState,
+  documentId: string | null,
+): MapEdgeTraceState {
+  return documentId ? createMapEdgeTraceState() : state;
+}
+
+export interface MapTraceState {
+  hoveredDocumentId: string | null;
+  edgeTraceState: MapEdgeTraceState;
+}
+
+export function resetMapTraceOnFlowUnmount(): MapTraceState {
+  return { hoveredDocumentId: null, edgeTraceState: createMapEdgeTraceState() };
+}
+
+export function clearMapDocumentTraceIfActive(
+  hoveredDocumentId: string | null,
+  documentId: string | null,
+): string | null {
+  return documentId !== null && hoveredDocumentId === documentId
+    ? null
+    : hoveredDocumentId;
+}
+
+export function connectedDocuments(
+  edges: readonly MapFlowEdge[],
+  documentId: string | null,
+): Set<string> {
+  const connected = new Set<string>();
+  if (!documentId) return connected;
+  for (const edge of edges) {
+    if (edge.source === documentId) connected.add(edge.target);
+    if (edge.target === documentId) connected.add(edge.source);
+  }
+  return connected;
+}
+
+export type MapNodeEmphasis = 'normal' | 'active' | 'connected' | 'muted';
+export type MapEdgeEmphasis = 'normal' | 'active' | 'muted';
+
+export function nodeEmphasis(
+  documentId: string,
+  activeDocumentId: string | null,
+  activeEdge: MapFlowEdge | null,
+  connected: ReadonlySet<string>,
+): MapNodeEmphasis {
+  if (activeEdge) {
+    return activeEdge.source === documentId || activeEdge.target === documentId
+      ? 'active'
+      : 'muted';
+  }
+  if (!activeDocumentId) return 'normal';
+  if (documentId === activeDocumentId) return 'active';
+  return connected.has(documentId) ? 'connected' : 'muted';
+}
+
+export function edgeEmphasis(
+  edge: MapFlowEdge,
+  activeDocumentId: string | null,
+  activeEdge: MapFlowEdge | null,
+): MapEdgeEmphasis {
+  if (activeEdge) return edge.id === activeEdge.id ? 'active' : 'muted';
+  if (!activeDocumentId) return 'normal';
+  return edge.source === activeDocumentId || edge.target === activeDocumentId
+    ? 'active'
+    : 'muted';
 }
 
 export type MapLayoutStatus = 'loading' | 'ready' | 'empty' | 'error';

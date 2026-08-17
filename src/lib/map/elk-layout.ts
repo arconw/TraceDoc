@@ -25,6 +25,7 @@ export interface MapNodeData extends Record<string, unknown> {
   emphasis?: 'normal' | 'active' | 'connected' | 'muted';
   onOpenDocument?: (documentId: string) => void;
   onTraceDocument?: (documentId: string | null) => void;
+  onTraceDocumentUnmount?: (documentId: string) => void;
 }
 
 export type MapFlowNode = Node<MapNodeData, 'mapFolder' | 'mapDocument'>;
