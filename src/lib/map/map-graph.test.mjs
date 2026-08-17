@@ -29,17 +29,24 @@ const {
   beginMapLayout,
   beginQueuedMapLayout,
   cancelQueuedMapLayout,
+  clearMapDocumentTraceIfActive,
+  clearMapEdgeTraceForDocument,
   completeQueuedMapLayout,
   completeEmptyMapLayout,
   completeMapLayout,
+  connectedDocuments,
   createMapEdgeTraceState,
   createMapLayoutSession,
   createMapLayoutRequestState,
+  edgeEmphasis,
   effectiveMapEdgeTraceId,
   failMapLayout,
   mapLayoutIsInteractive,
+  nodeEmphasis,
   queueMapLayout,
   reduceMapEdgeTrace,
+  resetMapTraceOnFlowUnmount,
+  resolveTracedEdge,
   retryQueuedMapLayout,
 } = await loadTypeScript('./map-view-state.ts');
 
@@ -710,3 +717,548 @@ test(
     }
   },
 );
+
+const REPEATED_DOCUMENT_NAMES = [
+  'index.md',
+  'database.md',
+  'api.md',
+  'types.md',
+  'readme.md',
+  'config.md',
+  'client.md',
+  'server.md',
+];
+
+function duplicateNameProject(areaCount, modulesPerArea) {
+  const folders = {
+    'folder:.': {
+      id: 'folder:.',
+      name: 'workspace',
+      path: '',
+      parentId: null,
+      childFolderIds: [],
+      documentIds: [],
+    },
+  };
+  const documents = {};
+  const documentIdsByArea = [];
+
+  for (let areaIndex = 0; areaIndex < areaCount; areaIndex += 1) {
+    const areaId = `folder:area-${areaIndex}`;
+    folders['folder:.'].childFolderIds.push(areaId);
+    const moduleIds = [];
+    folders[areaId] = {
+      id: areaId,
+      name: `area-${areaIndex}`,
+      path: `area-${areaIndex}`,
+      parentId: 'folder:.',
+      childFolderIds: moduleIds,
+      documentIds: [],
+    };
+    const areaDocumentIds = [];
+
+    for (let moduleIndex = 0; moduleIndex < modulesPerArea; moduleIndex += 1) {
+      const moduleId = `folder:area-${areaIndex}/module-${moduleIndex}`;
+      moduleIds.push(moduleId);
+      const name =
+        REPEATED_DOCUMENT_NAMES[
+          (areaIndex + moduleIndex) % REPEATED_DOCUMENT_NAMES.length
+        ];
+      const path = `area-${areaIndex}/module-${moduleIndex}/${name}`;
+      const item = document(
+        path,
+        moduleId,
+        `Document ${areaIndex}-${moduleIndex}`,
+      );
+      documents[item.id] = item;
+      areaDocumentIds.push(item.id);
+      folders[moduleId] = {
+        id: moduleId,
+        name: `module-${moduleIndex}`,
+        path: `area-${areaIndex}/module-${moduleIndex}`,
+        parentId: areaId,
+        childFolderIds: [],
+        documentIds: [item.id],
+      };
+    }
+
+    documentIdsByArea.push(areaDocumentIds);
+  }
+
+  const links = [];
+  let linkIndex = 0;
+  const nextLinkId = () => {
+    const id = `link:${String(linkIndex).padStart(5, '0')}`;
+    linkIndex += 1;
+    return id;
+  };
+
+  for (const areaDocumentIds of documentIdsByArea) {
+    for (let index = 0; index < areaDocumentIds.length - 1; index += 1) {
+      links.push(
+        link(
+          nextLinkId(),
+          areaDocumentIds[index],
+          areaDocumentIds[index + 1],
+          true,
+        ),
+      );
+    }
+  }
+
+  for (const name of REPEATED_DOCUMENT_NAMES) {
+    const sameNameDocumentIds = Object.values(documents)
+      .filter((item) => item.name === name)
+      .map((item) => item.id);
+    for (let index = 0; index < sameNameDocumentIds.length - 1; index += 1) {
+      links.push(
+        link(
+          nextLinkId(),
+          sameNameDocumentIds[index],
+          sameNameDocumentIds[index + 1],
+          true,
+        ),
+      );
+    }
+  }
+
+  const allDocumentIds = Object.keys(documents);
+  for (let index = 0; index < allDocumentIds.length; index += 4) {
+    links.push(link(nextLinkId(), allDocumentIds[index], null, false));
+  }
+
+  return {
+    rootPath: '/duplicate-names',
+    folders,
+    documents,
+    links,
+  };
+}
+
+function oracleConnections(graph) {
+  const connections = new Map(
+    Object.keys(graph.documents).map((id) => [id, new Set()]),
+  );
+  for (const graphLink of graph.links) {
+    connections.get(graphLink.sourceDocumentId).add(graphLink.targetDocumentId);
+    connections.get(graphLink.targetDocumentId).add(graphLink.sourceDocumentId);
+  }
+  return connections;
+}
+
+test(
+  'highlights only the hovered document and its true one-hop neighbors in a large graph with repeated file names',
+  { timeout: 60_000 },
+  async () => {
+    const project = duplicateNameProject(6, 40);
+    const graph = projectToMapGraph(project);
+    const layout = await layoutMapGraph(graph, new ELK());
+    const documentIds = Object.keys(graph.documents);
+    const connections = oracleConnections(graph);
+
+    assert.equal(documentIds.length, 240);
+    assert.ok(
+      REPEATED_DOCUMENT_NAMES.every((name) =>
+        documentIds.some((id) => graph.documents[id].name === name),
+      ),
+    );
+
+    const documentNodes = layout.nodes.filter(
+      (node) => node.data.kind === 'document',
+    );
+    const rectangles = absoluteRectangles(layout);
+    const hoveredId = documentNodes.reduce((rightmost, node) =>
+      rectangles[node.id].x > rectangles[rightmost.id].x ? node : rightmost,
+    ).id;
+    const hoveredCenterX =
+      rectangles[hoveredId].x + rectangles[hoveredId].width / 2;
+    const documentsToTheLeft = documentNodes.filter(
+      (node) =>
+        node.id !== hoveredId &&
+        rectangles[node.id].x + rectangles[node.id].width / 2 < hoveredCenterX,
+    );
+    assert.ok(
+      documentsToTheLeft.length > documentNodes.length / 4,
+      'fixture should place many unrelated documents to the left of the hovered node',
+    );
+
+    const hoveredNeighbors = connections.get(hoveredId);
+    const unrelatedEdge = layout.edges.find(
+      (edge) =>
+        edge.source !== hoveredId &&
+        edge.target !== hoveredId &&
+        !hoveredNeighbors.has(edge.source) &&
+        !hoveredNeighbors.has(edge.target),
+    );
+    assert.ok(
+      unrelatedEdge,
+      'fixture should contain an edge fully unrelated to the hovered document',
+    );
+
+    const staleTrace = reduceMapEdgeTrace(createMapEdgeTraceState(), {
+      source: 'focus',
+      edgeId: unrelatedEdge.id,
+    });
+    const staleActiveEdge = layout.edges.find(
+      (edge) => edge.id === effectiveMapEdgeTraceId(staleTrace),
+    );
+    const collidedHoveredEmphasis = nodeEmphasis(
+      hoveredId,
+      hoveredId,
+      staleActiveEdge,
+      connectedDocuments(layout.edges, hoveredId),
+    );
+    assert.notEqual(
+      collidedHoveredEmphasis,
+      'active',
+      'a leftover edge trace must not be able to mask the hovered document',
+    );
+    const collidedUnrelatedEmphasis = nodeEmphasis(
+      unrelatedEdge.source,
+      hoveredId,
+      staleActiveEdge,
+      connectedDocuments(layout.edges, hoveredId),
+    );
+    assert.equal(
+      collidedUnrelatedEmphasis,
+      'active',
+      'demonstrates the collision: a document unrelated to the hovered one is wrongly marked active',
+    );
+
+    const clearedTrace = clearMapEdgeTraceForDocument(staleTrace, hoveredId);
+    assert.equal(effectiveMapEdgeTraceId(clearedTrace), null);
+    const activeEdge = effectiveMapEdgeTraceId(clearedTrace)
+      ? layout.edges.find(
+          (edge) => edge.id === effectiveMapEdgeTraceId(clearedTrace),
+        )
+      : null;
+    const connected = connectedDocuments(layout.edges, hoveredId);
+    assert.deepEqual(connected, connections.get(hoveredId));
+
+    for (const documentId of documentIds) {
+      const emphasis = nodeEmphasis(
+        documentId,
+        hoveredId,
+        activeEdge,
+        connected,
+      );
+      if (documentId === hoveredId) {
+        assert.equal(emphasis, 'active', documentId);
+      } else if (connections.get(hoveredId).has(documentId)) {
+        assert.equal(emphasis, 'connected', documentId);
+      } else {
+        assert.equal(emphasis, 'muted', documentId);
+      }
+    }
+
+    for (const node of documentsToTheLeft) {
+      if (connections.get(hoveredId).has(node.id)) continue;
+      assert.equal(
+        nodeEmphasis(node.id, hoveredId, activeEdge, connected),
+        'muted',
+        `${node.id} is positioned left of the hovered node but is not connected to it`,
+      );
+    }
+
+    for (const edge of layout.edges) {
+      const expected =
+        edge.source === hoveredId || edge.target === hoveredId
+          ? 'active'
+          : 'muted';
+      assert.equal(
+        edgeEmphasis(edge, hoveredId, activeEdge),
+        expected,
+        edge.id,
+      );
+    }
+
+    const secondHoveredId = documentNodes.find(
+      (node) =>
+        node.id !== hoveredId && !connections.get(hoveredId).has(node.id),
+    ).id;
+    const secondConnected = connectedDocuments(layout.edges, secondHoveredId);
+    assert.notEqual(
+      nodeEmphasis(hoveredId, secondHoveredId, null, secondConnected),
+      'active',
+      'moving focus to a new document must clear the previous trace completely',
+    );
+  },
+);
+
+test('clears an edge trace left behind by either pointer or keyboard focus the same way', async () => {
+  const project = duplicateNameProject(3, 10);
+  const graph = projectToMapGraph(project);
+  const layout = await layoutMapGraph(graph, new ELK());
+  const documentIds = Object.keys(graph.documents);
+  const connections = oracleConnections(graph);
+  const targetId = documentIds.at(-1);
+  const staleEdge = layout.edges.find(
+    (edge) => edge.source !== targetId && edge.target !== targetId,
+  );
+  assert.ok(staleEdge);
+
+  for (const source of ['pointer', 'focus']) {
+    const staleTrace = reduceMapEdgeTrace(createMapEdgeTraceState(), {
+      source,
+      edgeId: staleEdge.id,
+    });
+    const clearedTrace = clearMapEdgeTraceForDocument(staleTrace, targetId);
+    assert.equal(effectiveMapEdgeTraceId(clearedTrace), null, source);
+
+    const connected = connectedDocuments(layout.edges, targetId);
+    assert.deepEqual(connected, connections.get(targetId), source);
+
+    for (const documentId of documentIds) {
+      const expected =
+        documentId === targetId
+          ? 'active'
+          : connections.get(targetId).has(documentId)
+            ? 'connected'
+            : 'muted';
+      assert.equal(
+        nodeEmphasis(documentId, targetId, null, connected),
+        expected,
+        `${source}:${documentId}`,
+      );
+    }
+  }
+});
+
+test('restores a still-live edge trace once the document that overrode it stops being hovered', async () => {
+  const graph = projectToMapGraph(nestedProject());
+  const layout = await layoutMapGraph(graph, new ELK());
+  const focusedEdge = layout.edges.find((edge) => edge.id === 'link:app-api');
+  const hoveredDocumentId = 'document:readme.md';
+  assert.ok(focusedEdge);
+  assert.notEqual(focusedEdge.source, hoveredDocumentId);
+  assert.notEqual(focusedEdge.target, hoveredDocumentId);
+
+  // The edge's hidden keyboard button is genuinely focused.
+  const edgeTraceState = reduceMapEdgeTrace(createMapEdgeTraceState(), {
+    source: 'focus',
+    edgeId: focusedEdge.id,
+  });
+  assert.equal(effectiveMapEdgeTraceId(edgeTraceState), focusedEdge.id);
+
+  // An unrelated document becomes actively hovered while the edge focus is
+  // still live: the document must take projection priority. This calls
+  // MapView's actual production gate, not a copy of it.
+  const tracedEdgeDuringHover = resolveTracedEdge(
+    edgeTraceState,
+    true,
+    layout.edges,
+  );
+  assert.equal(
+    tracedEdgeDuringHover,
+    null,
+    'the active document must take projection priority over the live edge trace',
+  );
+
+  const connectedToHovered = connectedDocuments(
+    layout.edges,
+    hoveredDocumentId,
+  );
+  for (const documentId of Object.keys(graph.documents)) {
+    const expected = documentId === hoveredDocumentId ? 'active' : 'muted';
+    assert.equal(
+      nodeEmphasis(
+        documentId,
+        hoveredDocumentId,
+        tracedEdgeDuringHover,
+        connectedToHovered,
+      ),
+      expected,
+      documentId,
+    );
+  }
+  for (const edge of layout.edges) {
+    assert.equal(
+      edgeEmphasis(edge, hoveredDocumentId, tracedEdgeDuringHover),
+      edge.source === hoveredDocumentId || edge.target === hoveredDocumentId
+        ? 'active'
+        : 'muted',
+      edge.id,
+    );
+  }
+
+  // Crucially, the live focus source was never cleared while suppressed.
+  assert.equal(
+    effectiveMapEdgeTraceId(edgeTraceState),
+    focusedEdge.id,
+    'a still-focused edge must survive the document taking priority',
+  );
+  assert.equal(edgeTraceState.focusedEdgeId, focusedEdge.id);
+
+  // The document loses hover/focus. The edge button's focus never moved, so
+  // its trace becomes effective again with no new pointer/focus event.
+  const tracedEdgeAfterHover = resolveTracedEdge(
+    edgeTraceState,
+    false,
+    layout.edges,
+  );
+  assert.equal(tracedEdgeAfterHover?.id, focusedEdge.id);
+
+  const connectedToNone = connectedDocuments(layout.edges, null);
+  for (const edge of layout.edges) {
+    assert.equal(
+      edgeEmphasis(edge, null, tracedEdgeAfterHover),
+      edge.id === focusedEdge.id ? 'active' : 'muted',
+      edge.id,
+    );
+  }
+  assert.equal(
+    nodeEmphasis(
+      focusedEdge.source,
+      null,
+      tracedEdgeAfterHover,
+      connectedToNone,
+    ),
+    'active',
+  );
+  assert.equal(
+    nodeEmphasis(
+      focusedEdge.target,
+      null,
+      tracedEdgeAfterHover,
+      connectedToNone,
+    ),
+    'active',
+  );
+  assert.equal(
+    nodeEmphasis(
+      hoveredDocumentId,
+      null,
+      tracedEdgeAfterHover,
+      connectedToNone,
+    ),
+    'muted',
+  );
+});
+
+test('resets a stale document trace when the flow unmounts, so a remounted map traces an edge immediately', async () => {
+  const graph = projectToMapGraph(nestedProject());
+  const layout = await layoutMapGraph(graph, new ELK());
+  const nextEdge = layout.edges.find((edge) => edge.id === 'link:app-store');
+  assert.ok(nextEdge);
+
+  // A document is hovered/focused (e.g. a document button holds keyboard
+  // focus). Mirrors MapView's reactive derivations.
+  let hoveredDocumentId = 'document:frontend/app.md';
+  let edgeTraceState = createMapEdgeTraceState();
+  let documentTraceActive = hoveredDocumentId !== null;
+  assert.equal(
+    resolveTracedEdge(edgeTraceState, documentTraceActive, layout.edges),
+    null,
+  );
+
+  // The flow is unmounted without a matching onblur/onpointerleave firing on
+  // the focused document node (e.g. Ctrl/Cmd+1 hides the map, or a
+  // {#key layoutRevision} remount tears the element down mid-focus). Left
+  // untouched, the stale hover survives the unmount intact.
+  const survivedUnmountUntouched = hoveredDocumentId;
+  assert.equal(
+    survivedUnmountUntouched,
+    'document:frontend/app.md',
+    'demonstrates the bug: an unmount alone does not clear a stale document trace',
+  );
+
+  // scheduleFlowMount now resets both fields on every mount-cycle
+  // transition via the production reducer.
+  ({ hoveredDocumentId, edgeTraceState } = resetMapTraceOnFlowUnmount());
+  documentTraceActive = hoveredDocumentId !== null;
+
+  assert.equal(hoveredDocumentId, null);
+  assert.deepEqual(edgeTraceState, createMapEdgeTraceState());
+  assert.equal(documentTraceActive, false);
+
+  // The flow remounts. The very first interaction is hovering/focusing a
+  // *different* edge - no other document needs to complete a full
+  // enter/leave cycle first for it to take effect.
+  edgeTraceState = reduceMapEdgeTrace(edgeTraceState, {
+    source: 'pointer',
+    edgeId: nextEdge.id,
+  });
+  const tracedEdge = resolveTracedEdge(
+    edgeTraceState,
+    documentTraceActive,
+    layout.edges,
+  );
+  assert.equal(
+    tracedEdge?.id,
+    nextEdge.id,
+    'edge tracing must work immediately after remount, not after a full document enter/leave cycle',
+  );
+
+  const connected = connectedDocuments(layout.edges, null);
+  assert.equal(
+    nodeEmphasis(nextEdge.source, null, tracedEdge, connected),
+    'active',
+  );
+  assert.equal(
+    nodeEmphasis(nextEdge.target, null, tracedEdge, connected),
+    'active',
+  );
+  assert.equal(
+    nodeEmphasis(survivedUnmountUntouched, null, tracedEdge, connected),
+    survivedUnmountUntouched === nextEdge.source ||
+      survivedUnmountUntouched === nextEdge.target
+      ? 'active'
+      : 'muted',
+    'the previously stale hovered document must not be pinned active anymore',
+  );
+});
+
+test('clears a document trace when its own virtualized node unmounts while still active', () => {
+  const documentA = 'document:frontend/app.md';
+
+  // The document button is hovered/focused, matching MapView's reactive
+  // documentTraceActive derivation.
+  let hoveredDocumentId = documentA;
+  assert.equal(hoveredDocumentId !== null, true);
+
+  // `onlyRenderVisibleElements` unmounts the individual node (e.g. the user
+  // panned it out of the viewport) without firing its onblur/onpointerleave
+  // callback first. MapDocumentNode's onDestroy hook calls this same
+  // production reducer with its own documentId, exactly like MapView's
+  // traceDocumentUnmount does.
+  hoveredDocumentId = clearMapDocumentTraceIfActive(
+    hoveredDocumentId,
+    documentA,
+  );
+
+  assert.equal(
+    hoveredDocumentId,
+    null,
+    'the trace must be cleared once the only source that could ever clear it is gone',
+  );
+  const documentTraceActive = hoveredDocumentId !== null;
+  assert.equal(documentTraceActive, false);
+});
+
+test('does not clear a different document trace from a stale unmount of a previously active node', () => {
+  const documentA = 'document:frontend/app.md';
+  const documentB = 'document:backend/api.md';
+
+  // Document A is hovered first.
+  let hoveredDocumentId = documentA;
+
+  // The user moves on to document B before A's node is torn down; B is now
+  // the genuinely active trace.
+  hoveredDocumentId = documentB;
+
+  // A's virtualized node is only unmounted afterwards (a late cleanup racing
+  // behind the new hover). Because `hoveredDocumentId` no longer equals A's
+  // own id, the guard must leave B's trace untouched.
+  hoveredDocumentId = clearMapDocumentTraceIfActive(
+    hoveredDocumentId,
+    documentA,
+  );
+
+  assert.equal(
+    hoveredDocumentId,
+    documentB,
+    'a late unmount of a no-longer-active document must not erase a different valid trace',
+  );
+  const documentTraceActive = hoveredDocumentId !== null;
+  assert.equal(documentTraceActive, true);
+});

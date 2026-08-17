@@ -25,15 +25,20 @@
     completeMapLayout,
     beginQueuedMapLayout,
     cancelQueuedMapLayout,
+    clearMapDocumentTraceIfActive,
     completeQueuedMapLayout,
+    connectedDocuments,
     createMapLayoutRequestState,
     createMapEdgeTraceState,
     createMapLayoutSession,
-    effectiveMapEdgeTraceId,
+    edgeEmphasis,
     failMapLayout,
     mapLayoutIsInteractive,
+    nodeEmphasis,
     queueMapLayout,
     reduceMapEdgeTrace,
+    resetMapTraceOnFlowUnmount,
+    resolveTracedEdge,
     retryQueuedMapLayout,
   } from '../map/map-view-state';
   import { mapLayoutSignature, projectToMapGraph } from '../map/project-graph';
@@ -75,8 +80,8 @@
   let edges: MapFlowEdge[] = [];
   let hoveredDocumentId: DocumentId | null = null;
   let edgeTraceState = createMapEdgeTraceState();
-  let tracedEdgeId: string | null = null;
   let tracedDocumentId: DocumentId | null = null;
+  let documentTraceActive = false;
   let tracedEdge: MapFlowEdge | null = null;
   let connectedDocumentIds = new SvelteSet<DocumentId>();
   let traceSummary = '';
@@ -108,11 +113,15 @@
   $: status = layoutSession.status;
   $: message = layoutSession.message;
   $: tracedDocumentId = hoveredDocumentId ?? selectedDocumentId;
-  $: tracedEdgeId = effectiveMapEdgeTraceId(edgeTraceState);
-  $: tracedEdge = tracedEdgeId
-    ? (layoutEdges.find((edge) => edge.id === tracedEdgeId) ?? null)
-    : null;
-  $: connectedDocumentIds = connectedDocuments(layoutEdges, tracedDocumentId);
+  $: documentTraceActive = hoveredDocumentId !== null;
+  $: tracedEdge = resolveTracedEdge(
+    edgeTraceState,
+    documentTraceActive,
+    layoutEdges,
+  );
+  $: connectedDocumentIds = new SvelteSet(
+    connectedDocuments(layoutEdges, tracedDocumentId),
+  );
   $: nodes = layoutNodes.map((node) => {
     if (node.data.kind !== 'document') return node;
     return {
@@ -128,6 +137,7 @@
         ),
         onOpenDocument,
         onTraceDocument: traceDocument,
+        onTraceDocumentUnmount: traceDocumentUnmount,
       },
     };
   });
@@ -303,6 +313,7 @@
     flowApi = null;
     sizeObserver?.disconnect();
     sizeObserver = null;
+    ({ hoveredDocumentId, edgeTraceState } = resetMapTraceOnFlowUnmount());
 
     if (!nextVisible || nextStatus !== 'ready') return;
     void mountFlowWhenSized(version, revision);
@@ -396,6 +407,13 @@
     hoveredDocumentId = documentId;
   }
 
+  function traceDocumentUnmount(documentId: string) {
+    hoveredDocumentId = clearMapDocumentTraceIfActive(
+      hoveredDocumentId,
+      documentId,
+    );
+  }
+
   function tracePointerEdge(edgeId: string | null) {
     edgeTraceState = reduceMapEdgeTrace(edgeTraceState, {
       source: 'pointer',
@@ -408,48 +426,6 @@
       source: 'focus',
       edgeId,
     });
-  }
-
-  function connectedDocuments(
-    layout: MapFlowEdge[],
-    documentId: DocumentId | null,
-  ) {
-    const connected = new SvelteSet<DocumentId>();
-    if (!documentId) return connected;
-    for (const edge of layout) {
-      if (edge.source === documentId) connected.add(edge.target);
-      if (edge.target === documentId) connected.add(edge.source);
-    }
-    return connected;
-  }
-
-  function nodeEmphasis(
-    documentId: string,
-    activeDocumentId: DocumentId | null,
-    activeEdge: MapFlowEdge | null,
-    connected: SvelteSet<DocumentId>,
-  ): 'normal' | 'active' | 'connected' | 'muted' {
-    if (activeEdge) {
-      return activeEdge.source === documentId ||
-        activeEdge.target === documentId
-        ? 'active'
-        : 'muted';
-    }
-    if (!activeDocumentId) return 'normal';
-    if (documentId === activeDocumentId) return 'active';
-    return connected.has(documentId) ? 'connected' : 'muted';
-  }
-
-  function edgeEmphasis(
-    edge: MapFlowEdge,
-    activeDocumentId: DocumentId | null,
-    activeEdge: MapFlowEdge | null,
-  ): 'normal' | 'active' | 'muted' {
-    if (activeEdge) return edge.id === activeEdge.id ? 'active' : 'muted';
-    if (!activeDocumentId) return 'normal';
-    return edge.source === activeDocumentId || edge.target === activeDocumentId
-      ? 'active'
-      : 'muted';
   }
 
   function traceSummaryForDocument(
