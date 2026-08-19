@@ -18,7 +18,8 @@
   } as const;
 
   $: ports = data.ports ?? [];
-  $: nodeEmphasized = data.emphasis === 'active';
+  $: nodeEmphasized =
+    data.emphasis === 'active' || data.emphasis === 'connected';
   $: relationshipSummary = `${data.incomingCount ?? 0} incoming, ${data.outgoingCount ?? 0} outgoing links`;
 
   function portClass(port: MapPort) {

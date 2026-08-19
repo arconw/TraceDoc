@@ -31,6 +31,7 @@ const {
   computeGatewayRegions,
   computeRoutingCost,
   absoluteRectangles: routingAbsoluteRectangles,
+  GATEWAY_LANE_OFFSET,
 } = await loadTypeScript('./routing.ts');
 const {
   beginMapLayout,
@@ -2131,7 +2132,7 @@ test(
       for (let index = 1; index < coordinates.length; index += 1) {
         const gap = coordinates[index] - coordinates[index - 1];
         assert.ok(
-          gap > 0 && gap <= 8,
+          gap > 0 && gap <= GATEWAY_LANE_OFFSET + 4,
           `gateway region ${region.id}: lane ${index} sits ${gap}px from its neighbor, expected a small deterministic step instead of an arbitrary gap`,
         );
       }
@@ -2142,7 +2143,7 @@ test(
           ? boundaryRect.height
           : boundaryRect.width;
       assert.ok(
-        span <= 64,
+        span <= (coordinates.length - 1) * GATEWAY_LANE_OFFSET + 4,
         `gateway region ${region.id}: 16 crossing coordinates span ${span}px, expected a converged cluster rather than a spread of individually-placed points`,
       );
       assert.ok(
