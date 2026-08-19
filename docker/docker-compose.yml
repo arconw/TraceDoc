@@ -1,0 +1,38 @@
+services:
+  linux:
+    build:
+      context: .
+      dockerfile: Dockerfile.linux
+    volumes:
+      - ..:/workspace
+      - node-modules-linux:/workspace/node_modules
+      - cargo-target-linux:/workspace/src-tauri/target
+      - ../release/linux:/out
+      - cargo-registry:/usr/local/cargo/registry
+      - npm-cache:/root/.npm
+    working_dir: /workspace
+
+  windows:
+    build:
+      context: .
+      dockerfile: Dockerfile.windows
+    volumes:
+      - ..:/workspace
+      - node-modules-windows:/workspace/node_modules
+      - cargo-target-windows:/workspace/src-tauri/target
+      - ../release/windows:/out
+      - cargo-registry-windows:/usr/local/cargo/registry
+      - npm-cache-windows:/root/.npm
+      - xwin-cache:/root/.cache/cargo-xwin
+    working_dir: /workspace
+
+volumes:
+  cargo-registry:
+  cargo-registry-windows:
+  npm-cache:
+  npm-cache-windows:
+  xwin-cache:
+  node-modules-linux:
+  node-modules-windows:
+  cargo-target-linux:
+  cargo-target-windows:

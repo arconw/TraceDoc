@@ -1,0 +1,32 @@
+FROM ubuntu:24.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates build-essential file git pkg-config \
+    clang lld llvm nsis \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain stable \
+    && rustup target add x86_64-pc-windows-msvc \
+    && cargo install --locked cargo-xwin
+
+# cargo-xwin downloads the MSVC CRT/SDK headers on first use and normally
+# prompts to accept Microsoft's license for them; this skips the prompt so
+# the build can run unattended. If the build stalls waiting on input, check
+# `cargo xwin --help` on the image's cargo-xwin version for the current flag.
+ENV XWIN_ACCEPT_LICENSE=1
+
+COPY build-windows.sh /usr/local/bin/build-windows.sh
+RUN chmod +x /usr/local/bin/build-windows.sh
+
+WORKDIR /workspace
+ENTRYPOINT ["/usr/local/bin/build-windows.sh"]
