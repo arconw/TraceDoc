@@ -358,6 +358,39 @@ function denseSkipChainFixture(): RoutingFixture {
   };
 }
 
+function hubInCornerFixture(): RoutingFixture {
+  const noiseCount = 20;
+  const hubDegree = 8;
+  const documents: RoutingFixtureDocument[] = [];
+  for (let index = 1; index <= noiseCount; index += 1) {
+    const left = `modules/noise-${padded(index)}-left.md`;
+    const mid = `modules/noise-${padded(index)}-mid.md`;
+    const right = `modules/noise-${padded(index)}-right.md`;
+    documents.push(doc(left, `Noise ${padded(index)} Left`, [mid]));
+    documents.push(doc(mid, `Noise ${padded(index)} Mid`, [right]));
+    documents.push(doc(right, `Noise ${padded(index)} Right`));
+  }
+  const half = hubDegree / 2;
+  const sources: string[] = [];
+  const targets: string[] = [];
+  for (let index = 1; index <= half; index += 1) {
+    sources.push(`modules/src-${padded(index)}.md`);
+    targets.push(`modules/tgt-${padded(index)}.md`);
+  }
+  for (const source of sources) {
+    documents.push(doc(source, source, ['modules/zzz-hub.md']));
+  }
+  for (const target of targets) documents.push(doc(target, target));
+  documents.push(doc('modules/zzz-hub.md', 'Zzz Hub', targets));
+  return {
+    slug: 'hub-in-corner',
+    name: 'High-degree hub placed in a corner',
+    invariant:
+      '20 unrelated left/mid/right noise chains alphabetically precede an 8-degree hub within the same folder, so a single unadjusted ELK pass leaves the hub pinned at the extreme edge of its layer instead of nearer its own sources and targets. The layout/routing feedback pass must measurably move the hub toward the center of its layer and reduce routing cost, specifically through degree-based model-order placement rather than spacing escalation alone.',
+    documents,
+  };
+}
+
 function incrementalModuleGraph(extra: boolean): RoutingFixtureDocument[] {
   const moduleCount = 12;
   const documents: RoutingFixtureDocument[] = [];
@@ -408,6 +441,7 @@ export const ROUTING_FIXTURES: RoutingFixture[] = [
   mixedHubFixture(),
   unrelatedNearCorridorFixture(),
   denseSkipChainFixture(),
+  hubInCornerFixture(),
   incrementalBaseFixture(),
   incrementalNextFixture(),
 ];

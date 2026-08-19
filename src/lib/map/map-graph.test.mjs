@@ -2410,6 +2410,86 @@ test(
   },
 );
 
+function hubCornerFraction(layout, hubId) {
+  const rectangles = routingAbsoluteRectangles(layout.nodes);
+  const documentNodes = layout.nodes.filter(
+    (node) => node.data.kind === 'document',
+  );
+  const ys = documentNodes.map((node) => rectangles[node.id].y);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+  const half = (maxY - minY) / 2;
+  if (half <= 0) return 0;
+  const hubY = rectangles[hubId].y;
+  return Math.abs(hubY - (minY + maxY) / 2) / half;
+}
+
+test(
+  'moves a high-degree hub out of a bad corner through degree-based model-order placement, not spacing alone',
+  { timeout: 60_000 },
+  async (context) => {
+    const fixture = routingFixtureBySlug('hub-in-corner');
+    const graph = projectToMapGraph(buildFixtureProject(fixture));
+    const hubId = 'document:modules/zzz-hub.md';
+
+    const singlePass = await layoutMapGraph(graph, new ELK(), {
+      maxIterations: 1,
+    });
+    const feedbackPass = await layoutMapGraph(graph, new ELK());
+    const feedbackPassAgain = await layoutMapGraph(graph, new ELK());
+
+    const singleCost = measureLayoutCost(singlePass);
+    const feedbackCost = measureLayoutCost(feedbackPass);
+    const singleFraction = hubCornerFraction(singlePass, hubId);
+    const feedbackFraction = hubCornerFraction(feedbackPass, hubId);
+
+    context.diagnostic(
+      `hub-in-corner: single-pass hub corner-distance fraction ${singleFraction.toFixed(2)} (cost ${singleCost.total.toFixed(1)}, structural ${singleCost.structural}) vs feedback-pass fraction ${feedbackFraction.toFixed(2)} (cost ${feedbackCost.total.toFixed(1)}, structural ${feedbackCost.structural})`,
+    );
+
+    assert.ok(
+      singleFraction > 0.9,
+      'fixture setup check: a single unadjusted ELK pass must actually pin the hub at an extreme edge of its layer for this to be a meaningful corner-placement test',
+    );
+    assert.ok(
+      feedbackFraction < singleFraction - 0.3,
+      'the feedback pass must measurably move the hub toward the center of its layer: a purely relative measure like this fraction would not shift from wider spacing alone, so an improvement here is attributable to degree-based model-order placement specifically',
+    );
+    assert.ok(
+      feedbackCost.total <= singleCost.total,
+      'the bounded feedback pass must never produce a worse routing-quality cost than a single, unadjusted ELK pass',
+    );
+    assert.ok(
+      feedbackCost.structural < singleCost.structural,
+      'the bounded feedback pass must measurably reduce structural routing defects caused by the hub being stuck in a corner',
+    );
+
+    assert.deepEqual(
+      feedbackPass.nodes.map((node) => [
+        node.id,
+        node.position.x,
+        node.position.y,
+      ]),
+      feedbackPassAgain.nodes.map((node) => [
+        node.id,
+        node.position.x,
+        node.position.y,
+      ]),
+      'the feedback pass must produce identical node placement across repeated runs of the same graph',
+    );
+    assert.deepEqual(
+      feedbackPass.edges.map((edge) => edge.data.points),
+      feedbackPassAgain.edges.map((edge) => edge.data.points),
+      'the feedback pass must route identically across repeated runs of the same graph',
+    );
+
+    feedbackPass.edges.forEach(assertRouteGeometry);
+    assertAvoidsDocumentInteriors(feedbackPass);
+    assertValidArrowAndPorts(feedbackPass, fixture.slug);
+    assertExplicitPortModel(feedbackPass, fixture.slug);
+  },
+);
+
 function portModelFixture() {
   const folder = {
     id: 'folder:zone',

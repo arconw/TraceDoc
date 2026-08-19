@@ -25,6 +25,10 @@ const HIGH_DEGREE_THRESHOLD = 8;
 const LAYOUT_FEEDBACK_ITERATIONS = 3;
 const LAYOUT_SPACING_MULTIPLIERS = [1, 1.35, 1.75];
 const LAYOUT_FEEDBACK_TIME_BUDGET_MS = 4000;
+const HUB_REORDER_SPACING_MULTIPLIERS = [
+  LAYOUT_SPACING_MULTIPLIERS[0],
+  LAYOUT_SPACING_MULTIPLIERS.at(-1)!,
+];
 
 export interface MapNodeData extends Record<string, unknown> {
   kind: 'folder' | 'document';
@@ -90,7 +94,7 @@ export async function layoutMapGraph(
       options.maxIterations ?? LAYOUT_FEEDBACK_ITERATIONS,
     ),
   );
-  let best: { layout: MapLayout; total: number } | null = null;
+  let best: { layout: MapLayout; cost: MapRoutingCost } | null = null;
   let previousTotal = Number.POSITIVE_INFINITY;
 
   for (let iteration = 0; iteration < maxIterations; iteration += 1) {
@@ -100,7 +104,7 @@ export async function layoutMapGraph(
     const layout = await layoutPass(graph, engine, degrees, spacingMultiplier);
     const cost = measureLayoutCost(layout);
 
-    if (!best || cost.total < best.total) best = { layout, total: cost.total };
+    if (!best || cost.total < best.cost.total) best = { layout, cost };
     const improved = cost.total < previousTotal;
     previousTotal = cost.total;
     const elapsed = performance.now() - startedAt;
@@ -110,7 +114,33 @@ export async function layoutMapGraph(
     if (elapsed >= LAYOUT_FEEDBACK_TIME_BUDGET_MS) break;
   }
 
+  if (maxIterations > 1 && best!.cost.structural > 0) {
+    best = await attemptHubReorder(graph, engine, degrees, best!, startedAt);
+  }
+
   return best!.layout;
+}
+
+async function attemptHubReorder(
+  graph: MapGraph,
+  engine: Pick<ELK, 'layout'>,
+  degrees: Map<string, number>,
+  best: { layout: MapLayout; cost: MapRoutingCost },
+  startedAt: number,
+): Promise<{ layout: MapLayout; cost: MapRoutingCost }> {
+  for (const spacingMultiplier of HUB_REORDER_SPACING_MULTIPLIERS) {
+    if (performance.now() - startedAt >= LAYOUT_FEEDBACK_TIME_BUDGET_MS) break;
+    const layout = await layoutPass(
+      graph,
+      engine,
+      degrees,
+      spacingMultiplier,
+      true,
+    );
+    const cost = measureLayoutCost(layout);
+    if (cost.total < best.cost.total) best = { layout, cost };
+  }
+  return best;
 }
 
 async function layoutPass(
@@ -118,10 +148,18 @@ async function layoutPass(
   engine: Pick<ELK, 'layout'>,
   degrees: Map<string, number>,
   spacingMultiplier: number,
+  promoteHighDegree = false,
 ): Promise<MapLayout> {
   const rootFolders = await Promise.all(
     graph.rootFolderIds.map((folderId) =>
-      layoutFolder(graph, folderId, engine, degrees, spacingMultiplier),
+      layoutFolder(
+        graph,
+        folderId,
+        engine,
+        degrees,
+        spacingMultiplier,
+        promoteHighDegree,
+      ),
     ),
   );
   const root = await layoutRootFolders(rootFolders, engine, spacingMultiplier);
@@ -270,17 +308,28 @@ async function layoutFolder(
   engine: Pick<ELK, 'layout'>,
   degrees: Map<string, number>,
   spacingMultiplier: number,
+  promoteHighDegree = false,
 ): Promise<ElkMapNode> {
   const folder = graph.folders[folderId];
   const childFolders = await Promise.all(
     folder.childFolderIds.map((childFolderId) =>
-      layoutFolder(graph, childFolderId, engine, degrees, spacingMultiplier),
+      layoutFolder(
+        graph,
+        childFolderId,
+        engine,
+        degrees,
+        spacingMultiplier,
+        promoteHighDegree,
+      ),
     ),
   );
   const documents = folder.documentIds
     .filter((documentId) => Boolean(graph.documents[documentId]))
-    .map((documentId) => buildDocumentNode(graph, documentId, degrees));
-  const children = [...childFolders, ...documents];
+    .map((documentId) => buildDocumentNode(graph, documentId));
+  const orderedDocuments = promoteHighDegree
+    ? promoteHighDegreeDocuments(documents, degrees)
+    : documents;
+  const children = [...childFolders, ...orderedDocuments];
 
   if (children.length === 0) {
     return {
@@ -295,11 +344,11 @@ async function layoutFolder(
   const layoutInput: ElkNode = {
     id: `layout:${folder.id}`,
     layoutOptions: layoutOptions(spacingMultiplier),
-    children: children.map(({ id, width, height, layoutOptions: hints }) => ({
+    children: children.map(({ id, width, height }) => ({
       id,
       width,
       height,
-      layoutOptions: { 'elk.portConstraints': 'FIXED_SIDE', ...hints },
+      layoutOptions: { 'elk.portConstraints': 'FIXED_SIDE' },
       ports: fixedSidePorts(id),
     })),
     edges: layoutEdgesForFolder(graph, folder.id),
@@ -410,14 +459,9 @@ function directChildForDocument(
   return null;
 }
 
-function buildDocumentNode(
-  graph: MapGraph,
-  documentId: string,
-  degrees: Map<string, number>,
-): ElkMapNode {
+function buildDocumentNode(graph: MapGraph, documentId: string): ElkMapNode {
   const document = graph.documents[documentId];
   const measuredWidth = 64 + Array.from(document.title).length * 7.2;
-  const degree = degrees.get(documentId) ?? 0;
 
   return {
     id: document.id,
@@ -427,11 +471,27 @@ function buildDocumentNode(
       Math.max(DOCUMENT_MIN_WIDTH, measuredWidth),
     ),
     height: DOCUMENT_HEIGHT,
-    layoutOptions:
-      degree >= HIGH_DEGREE_THRESHOLD
-        ? { 'elk.priority': String(Math.min(degree, 999)) }
-        : undefined,
   };
+}
+
+function promoteHighDegreeDocuments(
+  documents: ElkMapNode[],
+  degrees: Map<string, number>,
+): ElkMapNode[] {
+  const highDegree = documents
+    .filter((node) => (degrees.get(node.id) ?? 0) >= HIGH_DEGREE_THRESHOLD)
+    .sort((left, right) => {
+      const leftDegree = degrees.get(left.id) ?? 0;
+      const rightDegree = degrees.get(right.id) ?? 0;
+      return (
+        rightDegree - leftDegree ||
+        (left.id < right.id ? -1 : left.id > right.id ? 1 : 0)
+      );
+    });
+  const rest = documents.filter(
+    (node) => (degrees.get(node.id) ?? 0) < HIGH_DEGREE_THRESHOLD,
+  );
+  return [...highDegree, ...rest];
 }
 
 function layoutOptions(spacingMultiplier: number) {
