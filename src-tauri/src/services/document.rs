@@ -888,14 +888,14 @@ fn remove_windows_acknowledged_slot(path: &Path) -> Result<(), DocumentError> {
     if !path.exists() {
         return Ok(());
     }
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-        .map_err(|source| {
-            DocumentError::new(format!("Unable to verify conflict state: {source}"))
-        })?;
+    let file = retry_on_sharing_violation(|| {
+        fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    })
+    .map_err(|source| DocumentError::new(format!("Unable to verify conflict state: {source}")))?;
     let metadata = file.metadata().map_err(|source| {
         DocumentError::new(format!("Unable to verify conflict state: {source}"))
     })?;
@@ -1163,14 +1163,14 @@ fn transactional_replace_with_phase_hook(
     Ok(durability_warning)
 }
 
-#[cfg(any(test, target_os = "macos", windows))]
+#[cfg(any(test, target_os = "macos"))]
 enum RecoveredMutationError {
     RecoveryUnavailable,
     Mutation(std::io::Error),
     Verification,
 }
 
-#[cfg(any(test, target_os = "macos", windows))]
+#[cfg(any(test, target_os = "macos"))]
 impl fmt::Display for RecoveredMutationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1181,7 +1181,7 @@ impl fmt::Display for RecoveredMutationError {
     }
 }
 
-#[cfg(any(test, target_os = "macos", windows))]
+#[cfg(any(test, target_os = "macos"))]
 fn run_recovered_mutation<T>(
     target: &mut T,
     recovery_is_valid: impl FnOnce() -> bool,
@@ -1362,6 +1362,26 @@ fn transactional_replace(
     Ok(durability_warning)
 }
 
+/// Windows saving used to open the target with narrow sharing
+/// (`FILE_SHARE_READ` only) and hold that handle for the whole prepare +
+/// verify sequence, mutating the bytes in place. That turned any transient
+/// holder of the file - a virus scanner reacting to the previous write, the
+/// Windows Search indexer, OneDrive's sync agent, a second TraceDoc save -
+/// into an immediate, unretried "Save failed" with no recovery path in the
+/// UI (see `MarkdownEditor.svelte`'s `save()`, which only recognizes the
+/// "changed externally" wording as a recoverable conflict).
+///
+/// This mirrors how VS Code and most editors save on Windows instead: write
+/// the new bytes into a fresh sibling temp file (which nobody else is
+/// contending for), then swap it into place with a single atomic
+/// `MoveFileExW(..., MOVEFILE_REPLACE_EXISTING)`. The target is never held
+/// open across the transaction, so external readers/writers are never
+/// blocked by us, and the handful of brief opens we do need (the initial
+/// read, the final rename) are wrapped in `retry_on_sharing_violation` so a
+/// *momentary* lock from one of those background processes is absorbed
+/// instead of surfacing to the user. Because the swap is atomic, the file on
+/// disk is always either fully the old content or fully the new content -
+/// there is no partial-write state left to re-verify afterward.
 #[cfg(windows)]
 fn transactional_replace(
     root: &Path,
@@ -1372,7 +1392,8 @@ fn transactional_replace(
 ) -> Result<Option<String>, DocumentError> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
     let parent = path
@@ -1380,15 +1401,15 @@ fn transactional_replace(
         .ok_or_else(|| DocumentError::new("The document parent is unavailable"))?;
     let root_guard = WindowsAncestorGuard::open(root)?;
     let ancestors = WindowsAncestorGuard::open(parent)?;
-    let mut target = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .share_mode(FILE_SHARE_READ)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-        .map_err(|source| {
-            DocumentError::new(format!("Unable to lock document for saving: {source}"))
-        })?;
+
+    let mut target = retry_on_sharing_violation(|| {
+        fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    })
+    .map_err(|source| DocumentError::new(format!("Unable to open document for saving: {source}")))?;
     let metadata = target
         .metadata()
         .map_err(|source| DocumentError::new(format!("Unable to verify document: {source}")))?;
@@ -1402,43 +1423,43 @@ fn transactional_replace(
     if content_token_bytes(&original) != expected_content_token {
         return Err(external_change_error());
     }
+    drop(target);
+
     let relative = path
         .strip_prefix(root)
         .map_err(|_| DocumentError::new("The document is outside the workspace"))?;
     let relative_path = normalize_relative_path(relative)
         .map_err(|_| DocumentError::new("The document path is malformed"))?;
     let mut recovery = persist_windows_recovery(root, &relative_path, &original)?;
+    let staging_path = match create_windows_staging_file(path, content) {
+        Ok(staging_path) => staging_path,
+        Err(error) => {
+            return Err(DocumentError::new(format!(
+                "{error}. {}",
+                windows_recovery_message(root, &root_guard, &mut recovery)
+            )));
+        }
+    };
+
     before_commit(path);
+
     if !root_guard.matches()? || !ancestors.matches()? || windows_path_identity(path)? != identity {
+        let _ = fs::remove_file(&staging_path);
         return Err(DocumentError::new(format!(
             "The document changed externally. {}",
             windows_recovery_message(root, &root_guard, &mut recovery)
         )));
     }
-    if let Err(source) = run_recovered_mutation(
-        &mut target,
-        || windows_recovery_matches(&recovery),
-        |target| {
-            target
-                .set_len(0)
-                .and_then(|_| target.seek(SeekFrom::Start(0)))
-                .and_then(|_| target.write_all(content))
-                .and_then(|_| target.sync_all())
-        },
-        |target| {
-            Ok(read_file_bytes_portable(target)? == content
-                && windows_path_identity(path)? == identity
-                && root_guard.matches()?
-                && ancestors.matches()?
-                && windows_recovery_matches(&recovery))
-        },
-    ) {
+
+    if let Err(source) = retry_on_sharing_violation(|| windows_replace_file(&staging_path, path)) {
+        let _ = fs::remove_file(&staging_path);
         return Err(DocumentError::new(format!(
             "Unable to save document: {source}. {}",
             windows_recovery_message(root, &root_guard, &mut recovery)
         )));
     }
-    if !windows_recovery_matches(&recovery) {
+
+    if !windows_recovery_matches(&mut recovery) {
         return Err(DocumentError::new(format!(
             "The recovery changed during save. {}",
             windows_recovery_message(root, &root_guard, &mut recovery)
@@ -1446,6 +1467,115 @@ fn transactional_replace(
     }
     cleanup_successful_windows_transaction(recovery)?;
     Ok(None)
+}
+
+/// Retries `operation` with an increasing backoff when it fails with
+/// `ERROR_SHARING_VIOLATION` or `ERROR_LOCK_VIOLATION` - the transient,
+/// self-resolving errors Windows returns while another process (antivirus,
+/// the search indexer, OneDrive) briefly has the same path open. Any other
+/// error is returned immediately. The total retry window is a little over a
+/// second, which is enough to ride out the background holders above without
+/// making a genuinely stuck save feel unresponsive.
+#[cfg(windows)]
+fn retry_on_sharing_violation<T>(
+    mut operation: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    const RETRY_DELAYS_MS: [u64; 6] = [20, 40, 80, 160, 320, 640];
+    let mut attempt = 0;
+    loop {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if attempt < RETRY_DELAYS_MS.len() && is_transient_windows_lock_error(&error) =>
+            {
+                std::thread::sleep(Duration::from_millis(RETRY_DELAYS_MS[attempt]));
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn is_transient_windows_lock_error(error: &std::io::Error) -> bool {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+    matches!(
+        error.raw_os_error(),
+        Some(ERROR_SHARING_VIOLATION) | Some(ERROR_LOCK_VIOLATION)
+    )
+}
+
+/// Writes `content` into a fresh, uniquely-named temp file next to `path`
+/// (same directory, so the later rename is same-volume and atomic) and
+/// returns its path. Nothing else knows this path exists yet, so unlike the
+/// real target it is never contended.
+#[cfg(windows)]
+fn create_windows_staging_file(path: &Path, content: &[u8]) -> Result<PathBuf, DocumentError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_WRITE_THROUGH, FILE_SHARE_READ};
+
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| DocumentError::new("The document name is unavailable"))?
+        .to_string_lossy()
+        .into_owned();
+    let pid = std::process::id();
+    for attempt in 0..32u32 {
+        let staging_path = path.with_file_name(format!(".{file_name}.tracedoc-tmp-{pid}-{attempt}"));
+        let mut staging = match retry_on_sharing_violation(|| {
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .share_mode(FILE_SHARE_READ)
+                .custom_flags(FILE_FLAG_WRITE_THROUGH)
+                .open(&staging_path)
+        }) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(DocumentError::new(format!("Unable to prepare save: {error}")))
+            }
+        };
+        if let Err(error) = staging.write_all(content).and_then(|_| staging.sync_all()) {
+            let _ = fs::remove_file(&staging_path);
+            return Err(DocumentError::new(format!("Unable to prepare save: {error}")));
+        }
+        return Ok(staging_path);
+    }
+    Err(DocumentError::new(
+        "Unable to prepare save: could not allocate a temporary file",
+    ))
+}
+
+/// Atomically swaps `source` into `destination`'s place via
+/// `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`. This
+/// either fully succeeds (destination now has `source`'s content) or fully
+/// fails (destination is untouched) - there is no in-between state.
+#[cfg(windows)]
+fn windows_replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1471,7 +1601,7 @@ fn persist_windows_recovery(
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_FLAG_WRITE_THROUGH, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_FLAG_WRITE_THROUGH, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
     let directory_path = root.join(RECOVERY_DIRECTORY);
@@ -1484,14 +1614,14 @@ fn persist_windows_recovery(
             )))
         }
     };
-    let directory = fs::OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(&directory_path)
-        .map_err(|source| {
-            DocumentError::new(format!("Unable to open recovery directory: {source}"))
-        })?;
+    let directory = retry_on_sharing_violation(|| {
+        fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&directory_path)
+    })
+    .map_err(|source| DocumentError::new(format!("Unable to open recovery directory: {source}")))?;
     let directory_metadata = directory.metadata().map_err(|source| {
         DocumentError::new(format!("Unable to verify recovery directory: {source}"))
     })?;
@@ -1509,13 +1639,14 @@ fn persist_windows_recovery(
     let transaction_lock_identity = windows_file_identity(&transaction_lock)?;
     let bytes = encode_recovery_artifact(relative_path, recovery_timestamp()?, content);
     let slot_path = directory_path.join(recovery_slot_name(relative_path));
-    match fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .share_mode(FILE_SHARE_READ)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH)
-        .open(&slot_path)
-    {
+    match retry_on_sharing_violation(|| {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH)
+            .open(&slot_path)
+    }) {
         Ok(mut existing_file) => {
             let metadata = existing_file.metadata().map_err(|source| {
                 DocumentError::new(format!("Unable to classify recovery: {source}"))
@@ -1583,14 +1714,16 @@ fn persist_windows_recovery(
         )?,
     }
     let install_path = directory_path.join(recovery_auxiliary_name(relative_path, "install"));
-    let mut file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_WRITE_THROUGH)
-        .open(&install_path)
-        .map_err(|source| DocumentError::new(format!("Unable to create recovery: {source}")))?;
+    let mut file = retry_on_sharing_violation(|| {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_WRITE_THROUGH)
+            .open(&install_path)
+    })
+    .map_err(|source| DocumentError::new(format!("Unable to create recovery: {source}")))?;
     let mut install_guard = WindowsInstallGuard::new(install_path.clone(), &file)?;
     file.write_all(&bytes)
         .and_then(|_| file.sync_all())
@@ -1598,12 +1731,7 @@ fn persist_windows_recovery(
     let identity = windows_file_identity(&file)?;
     windows_move_file(&install_path, &slot_path)?;
     install_guard.active = false;
-    if !lock_windows_handle(&file) {
-        return Err(DocumentError::new(
-            "Unable to lock the persisted recovery artifact",
-        ));
-    }
-    let artifact = WindowsRecoveryArtifact {
+    let mut artifact = WindowsRecoveryArtifact {
         _transaction_lock: transaction_lock,
         transaction_lock_path,
         transaction_lock_identity,
@@ -1615,8 +1743,13 @@ fn persist_windows_recovery(
         identity,
         bytes,
     };
-    if !windows_recovery_matches(&artifact) {
+    if !windows_recovery_matches(&mut artifact) {
         return Err(DocumentError::new("Unable to verify persisted recovery"));
+    }
+    if !lock_windows_handle(&artifact.file) {
+        return Err(DocumentError::new(
+            "Unable to lock the persisted recovery artifact",
+        ));
     }
     Ok(artifact)
 }
@@ -1639,7 +1772,7 @@ fn ensure_windows_recovery_owner(directory: &Path, created: bool) -> Result<(), 
     if created {
         options.create_new(true);
     }
-    let mut file = options.open(&path).map_err(|source| {
+    let mut file = retry_on_sharing_violation(|| options.open(&path)).map_err(|source| {
         DocumentError::new(format!("Unable to verify recovery ownership: {source}"))
     })?;
     if created {
@@ -1695,13 +1828,13 @@ fn cleanup_successful_windows_transaction(
 }
 
 #[cfg(windows)]
-fn windows_recovery_matches(artifact: &WindowsRecoveryArtifact) -> bool {
+fn windows_recovery_matches(artifact: &mut WindowsRecoveryArtifact) -> bool {
     let directory_matches = windows_file_identity(&artifact.directory).ok()
         == Some(artifact.directory_identity)
         && windows_path_identity(&artifact.directory_path).ok()
             == Some(artifact.directory_identity);
-    let data = fs::read(&artifact.slot_path).ok();
     let identity = windows_path_identity(&artifact.slot_path).ok();
+    let data = read_file_bytes_portable(&mut artifact.file).ok();
     directory_matches
         && data.as_deref() == Some(artifact.bytes.as_slice())
         && identity == Some(artifact.identity)
@@ -1730,6 +1863,11 @@ fn windows_recovery_message(
     }
 }
 
+/// Retries internally (see `retry_on_sharing_violation`) because every
+/// caller in the recovery-artifact bookkeeping below is just as exposed to
+/// a transient external holder of the source/destination path as the main
+/// document write is - a stale renamed-away "conflict" slot from a virus
+/// scanner mid-scan, an indexer glancing at `.tracedoc-recovery/`, etc.
 #[cfg(windows)]
 fn windows_move_file(source: &Path, destination: &Path) -> Result<(), DocumentError> {
     use std::os::windows::ffi::OsStrExt;
@@ -1740,20 +1878,21 @@ fn windows_move_file(source: &Path, destination: &Path) -> Result<(), DocumentEr
         .encode_wide()
         .chain(Some(0))
         .collect();
-    if unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_WRITE_THROUGH,
-        )
-    } == 0
-    {
-        return Err(DocumentError::new(format!(
-            "Unable to install recovery: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    Ok(())
+    retry_on_sharing_violation(|| {
+        if unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        } == 0
+        {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    })
+    .map_err(|source| DocumentError::new(format!("Unable to install recovery: {source}")))
 }
 
 #[cfg(windows)]
@@ -1767,18 +1906,20 @@ fn acquire_windows_transaction_lock(
         FILE_SHARE_READ,
     };
     let path = directory.join(recovery_auxiliary_name(relative_path, "lock"));
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .share_mode(FILE_SHARE_READ)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH)
-        .open(path)
-        .map_err(|source| {
-            DocumentError::new(format!(
-                "The document is busy in another TraceDoc save: {source}"
-            ))
-        })?;
+    let file = retry_on_sharing_violation(|| {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH)
+            .open(&path)
+    })
+    .map_err(|source| {
+        DocumentError::new(format!(
+            "The document is busy in another TraceDoc save: {source}"
+        ))
+    })?;
     let metadata = file
         .metadata()
         .map_err(|source| DocumentError::new(format!("Unable to verify save lock: {source}")))?;
@@ -1856,14 +1997,16 @@ fn recreate_windows_recovery(
         RecoveryReferenceTarget::Current => artifact.slot_path.clone(),
     };
     let install = artifact.slot_path.with_extension("failure-install");
-    let mut file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_WRITE_THROUGH)
-        .open(&install)
-        .map_err(|source| DocumentError::new(format!("Unable to recreate recovery: {source}")))?;
+    let mut file = retry_on_sharing_violation(|| {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_WRITE_THROUGH)
+            .open(&install)
+    })
+    .map_err(|source| DocumentError::new(format!("Unable to recreate recovery: {source}")))?;
     let mut install_guard = WindowsInstallGuard::new(install.clone(), &file)?;
     file.write_all(&artifact.bytes)
         .and_then(|_| file.sync_all())
@@ -1895,14 +2038,16 @@ impl WindowsAncestorGuard {
             if current.parent().is_none() {
                 continue;
             }
-            let file = fs::OpenOptions::new()
-                .read(true)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-                .open(&current)
-                .map_err(|source| {
-                    DocumentError::new(format!("Unable to verify document ancestor: {source}"))
-                })?;
+            let file = retry_on_sharing_violation(|| {
+                fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                    .open(&current)
+            })
+            .map_err(|source| {
+                DocumentError::new(format!("Unable to verify document ancestor: {source}"))
+            })?;
             let metadata = file.metadata().map_err(|source| {
                 DocumentError::new(format!("Unable to verify document ancestor: {source}"))
             })?;
@@ -1940,12 +2085,14 @@ fn windows_path_identity(path: &Path) -> Result<(u32, u64), DocumentError> {
         FILE_SHARE_WRITE,
     };
 
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-        .map_err(|source| DocumentError::new(format!("Unable to verify document path: {source}")))?;
+    let file = retry_on_sharing_violation(|| {
+        fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    })
+    .map_err(|source| DocumentError::new(format!("Unable to verify document path: {source}")))?;
     windows_file_identity(&file)
 }
 
