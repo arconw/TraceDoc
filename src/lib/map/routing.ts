@@ -62,6 +62,20 @@ const ROUTE_CLEARANCE = 8;
 const FOLDER_INSET = 4;
 const BEND_COST = 20;
 const SHARED_SEGMENT_COST = 12;
+const GEOMETRY_EPSILON = 1e-6;
+
+export class RouteUnavailableError extends Error {
+  constructor(
+    readonly bounds: MapRect,
+    readonly source: MapPoint,
+    readonly target: MapPoint,
+  ) {
+    super(
+      `Unable to route inside ${bounds.x},${bounds.y},${bounds.width},${bounds.height}`,
+    );
+    this.name = 'RouteUnavailableError';
+  }
+}
 
 export function routeMapLinks(
   graph: MapGraph,
@@ -77,35 +91,58 @@ export function routeMapLinks(
   const routes: Record<string, MapRoute> = {};
 
   for (const descriptor of descriptors) {
-    const sourcePoint = portPoint(
-      descriptor.source,
-      descriptor.sourceSide,
-      rankFor(
+    try {
+      routes[descriptor.link.id] = routeDescriptor(
+        graph,
+        rectangles,
+        zoneRouters,
         portGroups,
-        portKey(descriptor.link.sourceDocumentId, descriptor.sourceSide, true),
-        descriptor.link.id,
-      ),
-    );
-    const targetPoint = portPoint(
-      descriptor.target,
-      descriptor.targetSide,
-      rankFor(
-        portGroups,
-        portKey(descriptor.link.targetDocumentId, descriptor.targetSide, false),
-        descriptor.link.id,
-      ),
-    );
-    const points = [sourcePoint];
-    const boundaryGateways: MapBoundaryGateway[] = [];
-    let current = movePoint(
-      sourcePoint,
-      descriptor.sourceSide,
-      ROUTE_CLEARANCE,
-    );
-    let currentZone =
-      graph.documents[descriptor.link.sourceDocumentId].parentId;
-    pushPoint(points, current);
+        gatewayGroups,
+        descriptor,
+      );
+    } catch (error) {
+      reportUnroutableLink(descriptor, error);
+    }
+  }
 
+  return routes;
+}
+
+function routeDescriptor(
+  graph: MapGraph,
+  rectangles: Record<string, MapRect>,
+  zoneRouters: Record<string, ZoneRouter>,
+  portGroups: Map<string, RankedMember[]>,
+  gatewayGroups: Map<string, RankedMember[]>,
+  descriptor: RouteDescriptor,
+): MapRoute {
+  const sourcePoint = portPoint(
+    descriptor.source,
+    descriptor.sourceSide,
+    rankFor(
+      portGroups,
+      portKey(descriptor.link.sourceDocumentId, descriptor.sourceSide, true),
+      descriptor.link.id,
+    ),
+  );
+  const targetPoint = portPoint(
+    descriptor.target,
+    descriptor.targetSide,
+    rankFor(
+      portGroups,
+      portKey(descriptor.link.targetDocumentId, descriptor.targetSide, false),
+      descriptor.link.id,
+    ),
+  );
+  const points = [sourcePoint];
+  const boundaryGateways: MapBoundaryGateway[] = [];
+  const reservations: ZoneReservation[] = [];
+  let current = movePoint(sourcePoint, descriptor.sourceSide, ROUTE_CLEARANCE);
+  let currentZone =
+    graph.documents[descriptor.link.sourceDocumentId].parentId;
+  pushPoint(points, current);
+
+  try {
     for (const folderId of descriptor.sourceBoundaries) {
       const gateway = routeGateway(
         rectangles[folderId],
@@ -119,7 +156,10 @@ export function routeMapLinks(
         oppositeSide(gateway.side),
         ROUTE_CLEARANCE,
       );
-      appendRoute(points, zoneRouters[currentZone].route(current, inside));
+      appendRoute(
+        points,
+        routeSegment(zoneRouters[currentZone], current, inside, reservations),
+      );
       pushPoint(points, gateway.point);
       current = movePoint(gateway.point, gateway.side, ROUTE_CLEARANCE);
       pushPoint(points, current);
@@ -140,7 +180,10 @@ export function routeMapLinks(
         descriptor.link.id,
       );
       const outside = movePoint(gateway.point, gateway.side, ROUTE_CLEARANCE);
-      appendRoute(points, zoneRouters[currentZone].route(current, outside));
+      appendRoute(
+        points,
+        routeSegment(zoneRouters[currentZone], current, outside, reservations),
+      );
       pushPoint(points, gateway.point);
       current = movePoint(
         gateway.point,
@@ -152,23 +195,56 @@ export function routeMapLinks(
       currentZone = folderId;
     }
 
-    const targetLead = movePoint(
-      targetPoint,
-      descriptor.targetSide,
-      ROUTE_CLEARANCE,
+    const targetLead = movePoint(targetPoint, descriptor.targetSide, ROUTE_CLEARANCE);
+    appendRoute(
+      points,
+      routeSegment(zoneRouters[currentZone], current, targetLead, reservations),
     );
-    appendRoute(points, zoneRouters[currentZone].route(current, targetLead));
     pushPoint(points, targetPoint);
-
-    routes[descriptor.link.id] = {
-      points: deduplicatePoints(points),
-      sourceSide: descriptor.sourceSide,
-      targetSide: descriptor.targetSide,
-      boundaryGateways,
-    };
+  } catch (error) {
+    // A link that routed cleanly through one or more zones before failing
+    // in a later one must not leave those earlier zones' reservations
+    // behind: they belong to an edge that will never be rendered, and
+    // would otherwise bias/penalize every other link that later shares
+    // those segments. Only a link whose descriptor completes in full keeps
+    // its reservations.
+    releaseReservations(reservations);
+    throw error;
   }
 
-  return routes;
+  return {
+    points: deduplicatePoints(points),
+    sourceSide: descriptor.sourceSide,
+    targetSide: descriptor.targetSide,
+    boundaryGateways,
+  };
+}
+
+interface ZoneReservation {
+  router: ZoneRouter;
+  points: MapPoint[];
+}
+
+function routeSegment(
+  router: ZoneRouter,
+  source: MapPoint,
+  target: MapPoint,
+  reservations: ZoneReservation[],
+): MapPoint[] {
+  const points = router.route(source, target);
+  reservations.push({ router, points });
+  return points;
+}
+
+function releaseReservations(reservations: ZoneReservation[]) {
+  for (const { router, points } of reservations) router.release(points);
+}
+
+function reportUnroutableLink(descriptor: RouteDescriptor, error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  console.warn(
+    `[map/routing] skipping unroutable link ${descriptor.link.id} (${descriptor.link.sourceDocumentId} -> ${descriptor.link.targetDocumentId}, lca ${descriptor.lcaId}): ${message}`,
+  );
 }
 
 export function segmentIntersectsRectInterior(
@@ -177,16 +253,32 @@ export function segmentIntersectsRectInterior(
   rect: MapRect,
 ) {
   if (source.x === target.x) {
-    if (source.x <= rect.x || source.x >= rect.x + rect.width) return false;
+    if (
+      source.x <= rect.x + GEOMETRY_EPSILON ||
+      source.x >= rect.x + rect.width - GEOMETRY_EPSILON
+    ) {
+      return false;
+    }
     const minimum = Math.min(source.y, target.y);
     const maximum = Math.max(source.y, target.y);
-    return maximum > rect.y && minimum < rect.y + rect.height;
+    return (
+      maximum > rect.y + GEOMETRY_EPSILON &&
+      minimum < rect.y + rect.height - GEOMETRY_EPSILON
+    );
   }
   if (source.y === target.y) {
-    if (source.y <= rect.y || source.y >= rect.y + rect.height) return false;
+    if (
+      source.y <= rect.y + GEOMETRY_EPSILON ||
+      source.y >= rect.y + rect.height - GEOMETRY_EPSILON
+    ) {
+      return false;
+    }
     const minimum = Math.min(source.x, target.x);
     const maximum = Math.max(source.x, target.x);
-    return maximum > rect.x && minimum < rect.x + rect.width;
+    return (
+      maximum > rect.x + GEOMETRY_EPSILON &&
+      minimum < rect.x + rect.width - GEOMETRY_EPSILON
+    );
   }
   return true;
 }
@@ -330,25 +422,48 @@ class ZoneRouter {
 
   route(source: MapPoint, target: MapPoint) {
     if (source.x === target.x || source.y === target.y) {
-      if (this.segmentClear(source, target)) {
+      if (this.segmentClear(source, target, this.obstacles)) {
         this.reserve([source, target]);
         return [source, target];
       }
     }
 
+    const primary = this.attemptGridRoute(source, target, this.obstacles);
+    if (primary) {
+      this.reserve(primary);
+      return primary;
+    }
+
+    const relaxedObstacles = this.obstacles.map((rect) =>
+      insetRect(rect, ROUTE_CLEARANCE),
+    );
+    const relaxed = this.attemptGridRoute(source, target, relaxedObstacles);
+    if (relaxed) {
+      this.reserve(relaxed);
+      return relaxed;
+    }
+
+    throw new RouteUnavailableError(this.bounds, source, target);
+  }
+
+  private attemptGridRoute(
+    source: MapPoint,
+    target: MapPoint,
+    obstacles: MapRect[],
+  ): MapPoint[] | null {
     const xs = uniqueNumbers([
       this.bounds.x,
       this.bounds.x + this.bounds.width,
       source.x,
       target.x,
-      ...this.obstacles.flatMap((rect) => [rect.x, rect.x + rect.width]),
+      ...obstacles.flatMap((rect) => [rect.x, rect.x + rect.width]),
     ]);
     const ys = uniqueNumbers([
       this.bounds.y,
       this.bounds.y + this.bounds.height,
       source.y,
       target.y,
-      ...this.obstacles.flatMap((rect) => [rect.y, rect.y + rect.height]),
+      ...obstacles.flatMap((rect) => [rect.y, rect.y + rect.height]),
     ]);
     const width = xs.length;
     const height = ys.length;
@@ -357,7 +472,7 @@ class ZoneRouter {
     for (let yIndex = 0; yIndex < height; yIndex += 1) {
       for (let xIndex = 0; xIndex < width; xIndex += 1) {
         const point = { x: xs[xIndex], y: ys[yIndex] };
-        if (this.pointValid(point)) valid[yIndex * width + xIndex] = 1;
+        if (this.pointValid(point, obstacles)) valid[yIndex * width + xIndex] = 1;
       }
     }
 
@@ -400,7 +515,7 @@ class ZoneRouter {
         if (!valid[nextIndex]) continue;
         const from = { x: xs[xIndex], y: ys[yIndex] };
         const to = { x: xs[nextX], y: ys[nextY] };
-        if (!this.segmentClear(from, to)) continue;
+        if (!this.segmentClear(from, to, obstacles)) continue;
         const segment = segmentKey(from, to);
         const distance = Math.abs(to.x - from.x) + Math.abs(to.y - from.y);
         const cost =
@@ -416,11 +531,7 @@ class ZoneRouter {
       }
     }
 
-    if (finalState < 0) {
-      throw new Error(
-        `Unable to route inside ${this.bounds.x},${this.bounds.y},${this.bounds.width},${this.bounds.height}`,
-      );
-    }
+    if (finalState < 0) return null;
 
     const reversed: MapPoint[] = [];
     let state = finalState;
@@ -432,25 +543,27 @@ class ZoneRouter {
       });
       state = previous[state];
     }
-    const route = compactPoints(reversed.reverse());
-    this.reserve(route);
-    return route;
+    return compactPoints(reversed.reverse());
   }
 
-  private pointValid(point: MapPoint) {
+  private pointValid(point: MapPoint, obstacles: MapRect[]) {
     if (
-      point.x < this.bounds.x ||
-      point.x > this.bounds.x + this.bounds.width ||
-      point.y < this.bounds.y ||
-      point.y > this.bounds.y + this.bounds.height
+      point.x < this.bounds.x - GEOMETRY_EPSILON ||
+      point.x > this.bounds.x + this.bounds.width + GEOMETRY_EPSILON ||
+      point.y < this.bounds.y - GEOMETRY_EPSILON ||
+      point.y > this.bounds.y + this.bounds.height + GEOMETRY_EPSILON
     ) {
       return false;
     }
-    return !this.obstacles.some((rect) => pointInsideRect(point, rect));
+    return !obstacles.some((rect) => pointInsideRect(point, rect));
   }
 
-  private segmentClear(source: MapPoint, target: MapPoint) {
-    return !this.obstacles.some((rect) =>
+  private segmentClear(
+    source: MapPoint,
+    target: MapPoint,
+    obstacles: MapRect[],
+  ) {
+    return !obstacles.some((rect) =>
       segmentIntersectsRectInterior(source, target, rect),
     );
   }
@@ -459,6 +572,19 @@ class ZoneRouter {
     for (let index = 1; index < points.length; index += 1) {
       const key = segmentKey(points[index - 1], points[index]);
       this.usage.set(key, (this.usage.get(key) ?? 0) + 1);
+    }
+  }
+
+  release(points: MapPoint[]) {
+    for (let index = 1; index < points.length; index += 1) {
+      const key = segmentKey(points[index - 1], points[index]);
+      const count = this.usage.get(key);
+      if (count === undefined) continue;
+      if (count <= 1) {
+        this.usage.delete(key);
+      } else {
+        this.usage.set(key, count - 1);
+      }
     }
   }
 }
@@ -727,10 +853,10 @@ function insetRect(rect: MapRect, amount: number): MapRect {
 
 function pointInsideRect(point: MapPoint, rect: MapRect) {
   return (
-    point.x > rect.x &&
-    point.x < rect.x + rect.width &&
-    point.y > rect.y &&
-    point.y < rect.y + rect.height
+    point.x > rect.x + GEOMETRY_EPSILON &&
+    point.x < rect.x + rect.width - GEOMETRY_EPSILON &&
+    point.y > rect.y + GEOMETRY_EPSILON &&
+    point.y < rect.y + rect.height - GEOMETRY_EPSILON
   );
 }
 

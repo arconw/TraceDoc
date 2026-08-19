@@ -1,5 +1,6 @@
 <script lang="ts">
   import { Handle, Position } from '@xyflow/svelte';
+  import { onDestroy } from 'svelte';
   import type { MapNodeData } from '../map/elk-layout';
 
   export let data: MapNodeData;
@@ -36,6 +37,10 @@
     focused = value;
     updateTrace();
   }
+
+  onDestroy(() => {
+    if (data.documentId) data.onTraceDocumentUnmount?.(data.documentId);
+  });
 </script>
 
 {#each ports as port (port.side)}

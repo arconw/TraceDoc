@@ -17,6 +17,7 @@ const {
   closesDeletedBufferWithoutDiskAccess,
   editorReadIsCurrent,
   retainedLocalBaseline,
+  writeResultIsStale,
 } = await import(moduleUrl);
 
 test('rejects slow keep-mine success and catch paths after switching documents', () => {
@@ -75,4 +76,40 @@ test('closes an externally deleted dirty buffer without reading the missing path
   assert.equal(closesDeletedBufferWithoutDiskAccess('deleted'), true);
   assert.equal(closesDeletedBufferWithoutDiskAccess('modified'), false);
   assert.equal(closesDeletedBufferWithoutDiskAccess(null), false);
+});
+
+test('does not flag a successful save as stale when the backend revision advanced past the request', () => {
+  assert.equal(writeResultIsStale(6, 5), false);
+  assert.equal(writeResultIsStale(101, 100), false);
+});
+
+test('flags a write result as stale only when the backend revision failed to move past the request', () => {
+  assert.equal(writeResultIsStale(5, 5), true);
+  assert.equal(writeResultIsStale(4, 5), true);
+});
+
+test('an unrelated concurrent patch racing in over the event channel must not turn a successful save into a false conflict', () => {
+  // Reproduces the reported "Markdown documents cannot be saved" failure.
+  // The backend serializes every workspace-revision bump behind a single
+  // write lock, so a save that started when the client believed the
+  // revision was 5 and that the backend committed as revision 6 is
+  // unambiguously successful and newer than the request.
+  //
+  // Before this fix, MarkdownEditor.svelte's save() additionally compared
+  // the backend's result against the *live* reactive `workspaceRevision`
+  // store value. That value travels over a separate 'workspace-patch'
+  // event channel and can already have ticked forward -- for example
+  // because of an edit to a completely unrelated document -- by the time
+  // the save() promise resolves. The old inline predicate below is kept
+  // here only to document the bug being fixed; production code no longer
+  // contains it.
+  const resultRevision = 6;
+  const requestRevision = 5;
+  const racingLiveRevision = 7; // arrived via a separate channel mid-flight
+
+  const oldPredicateFlaggedThisAsAConflict =
+    resultRevision <= requestRevision || resultRevision < racingLiveRevision;
+  assert.equal(oldPredicateFlaggedThisAsAConflict, true);
+
+  assert.equal(writeResultIsStale(resultRevision, requestRevision), false);
 });

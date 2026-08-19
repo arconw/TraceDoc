@@ -15,7 +15,7 @@ Single-buffer CodeMirror 6 editor. Owns document read/save lifecycle, dirty stat
 - `isDirty()` — exposes current buffer divergence.
 - `getSaveError()` — exposes current save/load message to the navigation dialog.
 - `find()` — focuses CodeMirror and opens search for a loaded document.
-- `save()` — validates readiness/conflict, sends optimistic token+revision save, applies returned patches, and preserves concurrent edits.
+- `save()` — validates readiness/conflict, sends optimistic token+revision save, and applies returned patches. Staleness is decided by [`writeResultIsStale`](../editor/request-state.ts.md) against the revision snapshot captured when the request started, never against the live `workspaceRevision` prop, which can advance mid-flight over the separate `workspace-patch` event channel for reasons unrelated to this save.
 - `createEditorState(content, editable)` — builds the complete CodeMirror extension/keymap/read-only state with original line separator.
 - `loadDocument(target, targetId, discardLocal)` — version/generation-gated read; resets or activates the canonical buffer.
 - `retryLoad()` — repeats the current failed read.
@@ -30,6 +30,6 @@ Single-buffer CodeMirror 6 editor. Owns document read/save lifecycle, dirty stat
 ## Invariants
 
 - One CodeMirror buffer is authoritative for the active document.
-- Async results must match request version, document ID, workspace generation, and monotonic revision.
+- Async results must match request version, document ID, workspace generation, and monotonic revision — compared against the value captured when the request started, not the live reactive value, which can change while the request is in flight.
 - Failed/conflicted saves never discard text.
 - Store index patches are applied even if selection changes after the save request.

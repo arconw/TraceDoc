@@ -1,17 +1,28 @@
 <script lang="ts">
   import type { DocumentId, FolderId, ProjectModel } from '../types/workspace';
   import DocumentRow from './DocumentRow.svelte';
+  import FolderNode from './FolderNode.svelte';
 
-  export let project: ProjectModel;
-  export let folderId: FolderId;
-  export let depth: number;
-  export let expandedFolderIds: ReadonlySet<FolderId>;
-  export let selectedDocumentId: DocumentId | null;
-  export let onToggle: (folderId: FolderId) => void;
-  export let onSelectDocument: (documentId: DocumentId) => void;
+  let {
+    project,
+    folderId,
+    depth,
+    expandedFolderIds,
+    selectedDocumentId,
+    onToggle,
+    onSelectDocument,
+  }: {
+    project: ProjectModel;
+    folderId: FolderId;
+    depth: number;
+    expandedFolderIds: ReadonlySet<FolderId>;
+    selectedDocumentId: DocumentId | null;
+    onToggle: (folderId: FolderId) => void;
+    onSelectDocument: (documentId: DocumentId) => void;
+  } = $props();
 
-  $: folder = project.folders[folderId];
-  $: expanded = expandedFolderIds.has(folderId);
+  let folder = $derived(project.folders[folderId]);
+  let expanded = $derived(expandedFolderIds.has(folderId));
 
   function handleKeydown(event: KeyboardEvent) {
     if (
@@ -46,7 +57,7 @@
     {#if expanded}
       <ul>
         {#each folder.childFolderIds as childFolderId (childFolderId)}
-          <svelte:self
+          <FolderNode
             {project}
             folderId={childFolderId}
             depth={depth + 1}

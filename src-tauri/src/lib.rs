@@ -6,7 +6,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(services::document::WorkspaceSession::default())
-        .manage(services::watcher::WorkspaceWatcher::default())
+        .manage(services::watcher::WorkspaceWatcher)
         .invoke_handler(tauri::generate_handler![
             commands::app::get_app_info,
             commands::workspace::open_workspace,

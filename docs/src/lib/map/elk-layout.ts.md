@@ -6,7 +6,7 @@ Builds deterministic recursive compound placement with ELK, then invokes [`routi
 
 ## Contracts
 
-- `MapNodeData` — folder/document label/path, degree, emphasis, open/trace callbacks.
+- `MapNodeData` — folder/document label/path, degree, emphasis, open/trace/trace-unmount callbacks.
 - `MapFlowNode` — non-draggable folder/document node.
 - `MapEdgeData` — orthogonal points, endpoints/sides/gateways, accessibility label, emphasis/trace callback.
 - `MapFlowEdge` — nonselectable custom route edge.

@@ -36,6 +36,7 @@
     closesDeletedBufferWithoutDiskAccess,
     editorReadIsCurrent,
     retainedLocalBaseline,
+    writeResultIsStale,
   } from '../editor/request-state';
   import { richMarkdownEditing } from '../editor/rich-markdown';
   import { projectStore } from '../stores/project';
@@ -183,10 +184,7 @@
         workspaceGeneration: requestGeneration,
       });
 
-      if (
-        indexUpdate.workspaceRevision <= requestRevision ||
-        indexUpdate.workspaceRevision < workspaceRevision
-      ) {
+      if (writeResultIsStale(indexUpdate.workspaceRevision, requestRevision)) {
         conflict = 'modified';
         status = 'ready';
         return false;
