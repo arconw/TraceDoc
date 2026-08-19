@@ -98,8 +98,17 @@
   }
 
   $: interactionPath = serializePoints(data?.points ?? []);
-  $: visiblePath = buildVisiblePath(data?.points ?? [], data?.crossingGaps ?? []);
+  $: visiblePath = buildVisiblePath(
+    data?.points ?? [],
+    data?.crossingGaps ?? [],
+  );
   $: chevrons = data?.chevrons ?? [];
+  $: corridor = data?.corridor ?? null;
+  $: corridorReverse = corridor
+    ? corridor.axis === 'horizontal'
+      ? corridor.direction === 'left'
+      : corridor.direction === 'up'
+    : false;
 
   function updateTrace() {
     data?.onTracePointerEdge?.(hovered ? id : null);
@@ -115,8 +124,11 @@
   d={visiblePath}
   class:active={data?.emphasis === 'active'}
   class:muted={data?.emphasis === 'muted'}
+  class:corridor={Boolean(corridor)}
+  class:corridor-reverse={corridorReverse}
   class="map-route"
   marker-end={markerEnd}
+  data-corridor={corridor?.corridorId}
   aria-hidden="true"
 />
 {#each chevrons as chevron, index (index)}
@@ -151,6 +163,14 @@
       opacity 90ms ease,
       stroke 90ms ease,
       stroke-width 90ms ease;
+  }
+
+  .map-route.corridor {
+    stroke-width: 1.3;
+  }
+
+  .map-route.corridor-reverse {
+    stroke-dasharray: 3 2;
   }
 
   .map-route.active {

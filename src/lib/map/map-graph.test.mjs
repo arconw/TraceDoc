@@ -2905,3 +2905,148 @@ test(
     assertCrossingGapsAreInterior(Object.values(routes));
   },
 );
+
+function corridorThresholdFixture() {
+  const realCount = 3;
+  const noiseCount = 2;
+  const folder = {
+    id: 'folder:corridor-threshold',
+    name: 'corridor-threshold',
+    path: 'corridor-threshold',
+    parentId: null,
+    childFolderIds: [],
+    documentIds: [
+      ...Array.from(
+        { length: realCount },
+        (_, index) => `document:real-${index}-left`,
+      ),
+      ...Array.from(
+        { length: realCount },
+        (_, index) => `document:real-${index}-right`,
+      ),
+      ...Array.from(
+        { length: noiseCount },
+        (_, index) => `document:noise-${index}-left`,
+      ),
+      ...Array.from(
+        { length: noiseCount },
+        (_, index) => `document:noise-${index}-right`,
+      ),
+    ],
+  };
+  const documents = folder.documentIds.map((id) =>
+    routableDocument(id, folder.id, id),
+  );
+  const realLinks = Array.from({ length: realCount }, (_, index) =>
+    routableLink(
+      `link:real-${index}`,
+      `document:real-${index}-left`,
+      `document:real-${index}-right`,
+    ),
+  );
+  const noiseLinks = Array.from({ length: noiseCount }, (_, index) =>
+    routableLink(
+      `link:noise-${index}`,
+      `document:noise-${index}-left`,
+      `document:noise-${index}-right`,
+    ),
+  );
+  const graph = routableGraph([folder], documents, [
+    ...realLinks,
+    ...noiseLinks,
+  ]);
+  const nodes = [
+    {
+      id: folder.id,
+      position: { x: 0, y: 0 },
+      width: 750,
+      height: 380,
+      data: { kind: 'folder' },
+    },
+    ...Array.from({ length: realCount }, (_, index) =>
+      rectNode(
+        `document:real-${index}-left`,
+        folder.id,
+        20,
+        100 + index * 20,
+        60,
+        16,
+      ),
+    ),
+    ...Array.from({ length: realCount }, (_, index) =>
+      rectNode(
+        `document:real-${index}-right`,
+        folder.id,
+        620,
+        100 + index * 20,
+        60,
+        16,
+      ),
+    ),
+    ...Array.from({ length: noiseCount }, (_, index) =>
+      rectNode(
+        `document:noise-${index}-left`,
+        folder.id,
+        20,
+        300 + index * 20,
+        60,
+        16,
+      ),
+    ),
+    ...Array.from({ length: noiseCount }, (_, index) =>
+      rectNode(
+        `document:noise-${index}-right`,
+        folder.id,
+        620,
+        300 + index * 20,
+        60,
+        16,
+      ),
+    ),
+  ];
+  return { graph, nodes, realCount, noiseCount };
+}
+
+test(
+  'requires at least CORRIDOR_MIN_MEMBERS parallel edges before they cluster into a corridor',
+  { timeout: 60_000 },
+  () => {
+    const { graph, nodes, realCount } = corridorThresholdFixture();
+    const routes = routeMapLinks(graph, nodes);
+    const realRoutes = Array.from(
+      { length: realCount },
+      (_, index) => routes[`link:real-${index}`],
+    );
+    const noiseRoutes = [routes['link:noise-0'], routes['link:noise-1']];
+
+    assert.ok(
+      realRoutes.every(Boolean) && noiseRoutes.every(Boolean),
+      'every fixture link must route',
+    );
+    assert.ok(
+      realRoutes.every((route) => route.corridor !== null),
+      'a dense group at or above CORRIDOR_MIN_MEMBERS must cluster into a corridor',
+    );
+    assert.equal(
+      new Set(realRoutes.map((route) => route.corridor.corridorId)).size,
+      1,
+      'the real group must share exactly one corridor',
+    );
+    assert.deepEqual(
+      [...realRoutes.map((route) => route.corridor.laneIndex)].sort(
+        (left, right) => left - right,
+      ),
+      Array.from({ length: realCount }, (_, index) => index),
+      'the real group keeps distinct, deterministic lane indexes',
+    );
+    assert.ok(
+      noiseRoutes.every((route) => route.corridor === null),
+      'two coincidentally parallel short edges below CORRIDOR_MIN_MEMBERS must never cluster into a corridor',
+    );
+    assert.equal(
+      computeRoutingCorridors(routes).length,
+      1,
+      'only the real, at-threshold group may register as a corridor',
+    );
+  },
+);
