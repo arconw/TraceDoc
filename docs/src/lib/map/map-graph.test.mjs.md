@@ -14,6 +14,7 @@ esbuild-loads production TypeScript modules and exercises pure state, ELK layout
 - `oracleConnections(graph)` — per-document one-hop neighbor `Set`, derived directly from `MapGraph.links`, independent of the code under test.
 - `event` — edge-trace event builder.
 - `assertOrthogonal`, `absoluteRectangles`, nested `positionFor`, `routeIntersectsRect`, `assertAvoidsDocumentInteriors` — geometry assertions.
+- `sideFromHandle(handle, prefix)`, `movesTowardSide(from, to, side)` — parse a `source-<side>`/`target-<side>` handle into a `MapSide`, and check a point pair moves in that side's direction; used by `assertValidArrowAndPorts`.
 - `ancestorIds`, `expectedBoundaryIds`, `assertFolderGatewayPolicy` — hierarchy/gateway oracle.
 - `positions(layout)` — deterministic node-position projection.
 - `routableGraph(folders, documents, links)`, `routableDocument`, `routableLink` — minimal `MapGraph`/`RoutableMapNode` fixtures that call `routeMapLinks` directly, bypassing ELK; `routableGraph` accepts an array of folders (the first is the root) so fixtures can nest zones.
@@ -47,7 +48,7 @@ esbuild-loads production TypeScript modules and exercises pure state, ELK layout
 Every case below runs against all or specific fixtures in [`routing-fixtures.ts`](routing-fixtures.ts.md) — the same specs `scripts/generate-map-fixtures.mjs` renders to the on-disk debug workspaces under `test-fixtures/map-routing/`. They assert the invariants from the epic's phase-1 issue that already apply to the current router; invariants that only make sense once a later phase lands (ports, chevrons, typed corridor/lane objects, crossing markers) are `skip`-marked with a reason instead of deleted, per that issue.
 
 - `assertRouteGeometry(edge)` — orthogonal, finite, and free of zero-length segments.
-- `assertValidArrowAndPorts(layout, slug)` — every edge has an `arrowclosed` marker and a source/target side handle.
+- `assertValidArrowAndPorts(layout, slug)` — every edge has an `arrowclosed` marker and a valid source/target side handle (`sideFromHandle`), and (`movesTowardSide`) the first and last points of `edge.data.points` actually move away from the source / into the target in the direction that handle side names — a real cross-check between the encoded side and the route's own geometry, not just presence.
 - `segmentsCross(...)`, `countRouteCrossings(edges)` — proper (non-parallel, non-touching-endpoint) orthogonal segment crossing detector, used only to record a diagnostic baseline; a real crossing is never itself treated as a fault.
 - 'routes every deterministic stress fixture identically twice with finite, orthogonal, interior-safe geometry' — for every fixture in `ROUTING_FIXTURES`: lays it out twice and asserts identical node positions and edge points (determinism), asserts `assertRouteGeometry`/`assertAvoidsDocumentInteriors`/`assertValidArrowAndPorts`, and asserts the whole fixture set stays under a 60s bounded-layout-time budget (reported via `context.diagnostic`).
 - 'routes the cross-folder highway and nested fixtures through ordered, hierarchy-correct boundary gateways' — runs `assertFolderGatewayPolicy` (the existing hierarchy/gateway oracle) against `cross-folder-highway`, `nested-to-external`, and `unrelated-near-corridor`.

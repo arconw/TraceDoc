@@ -1641,16 +1641,50 @@ function assertRouteGeometry(edge) {
   }
 }
 
+const MAP_SIDES = new Set(['top', 'right', 'bottom', 'left']);
+
+function sideFromHandle(handle, prefix) {
+  if (typeof handle !== 'string' || !handle.startsWith(`${prefix}-`)) {
+    return null;
+  }
+  const side = handle.slice(prefix.length + 1);
+  return MAP_SIDES.has(side) ? side : null;
+}
+
+function movesTowardSide(from, to, side) {
+  if (side === 'left') return to.x < from.x && to.y === from.y;
+  if (side === 'right') return to.x > from.x && to.y === from.y;
+  if (side === 'top') return to.y < from.y && to.x === from.x;
+  return to.y > from.y && to.x === from.x;
+}
+
 function assertValidArrowAndPorts(layout, slug) {
-  assert.ok(
-    layout.edges.every(
-      (edge) =>
-        edge.markerEnd?.type === 'arrowclosed' &&
-        typeof edge.sourceHandle === 'string' &&
-        typeof edge.targetHandle === 'string',
-    ),
-    `${slug} is missing a valid arrow marker or side handle on some edge`,
-  );
+  for (const edge of layout.edges) {
+    assert.equal(
+      edge.markerEnd?.type,
+      'arrowclosed',
+      `${slug}: ${edge.id} is missing a valid arrow marker`,
+    );
+    const sourceSide = sideFromHandle(edge.sourceHandle, 'source');
+    const targetSide = sideFromHandle(edge.targetHandle, 'target');
+    assert.ok(
+      sourceSide,
+      `${slug}: ${edge.id} has no valid source side handle`,
+    );
+    assert.ok(
+      targetSide,
+      `${slug}: ${edge.id} has no valid target side handle`,
+    );
+    const points = edge.data.points;
+    assert.ok(
+      movesTowardSide(points[0], points[1], sourceSide),
+      `${slug}: ${edge.id} leaves its source in a direction inconsistent with its source handle side`,
+    );
+    assert.ok(
+      movesTowardSide(points.at(-1), points.at(-2), targetSide),
+      `${slug}: ${edge.id} enters its target from a direction inconsistent with its target handle side`,
+    );
+  }
 }
 
 function segmentsCross(sourceA, targetA, sourceB, targetB) {
@@ -1830,13 +1864,6 @@ test(
       'every incoming edge must land on a distinct point along the hub boundary',
     );
 
-    // The current router ranks a side's incoming and outgoing ports in
-    // separate groups (see routing.ts portKey), so a lane at the extreme
-    // edge of the hub's boundary can land an incoming and an outgoing edge
-    // on the exact same physical point when both happen to pick the same
-    // side. Coordinating ports across direction is exactly the future
-    // ports-phase invariant skipped above; this is its current-router
-    // baseline, not a hard pass/fail assertion yet.
     const allHubEndpoints = [
       ...outgoing.map((edge) => JSON.stringify(edge.data.points[0])),
       ...incoming.map((edge) => JSON.stringify(edge.data.points.at(-1))),

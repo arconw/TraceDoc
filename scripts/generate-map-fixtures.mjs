@@ -30,7 +30,7 @@ function renderMarkdown(fixture, document) {
   const lines = [`# ${document.title}`];
 
   if (document.links.length > 0) {
-    lines.push('', '## References');
+    lines.push('', '## References', '');
     for (const targetPath of document.links) {
       const relative =
         posix.relative(posix.dirname(document.path), targetPath) || targetPath;
