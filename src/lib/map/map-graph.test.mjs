@@ -2089,6 +2089,7 @@ test(
       2,
       'the frontend and backend boundaries each converge through one deterministic gateway region',
     );
+    const crossFolderRects = absoluteRectangles(crossFolderLayout);
     for (const region of crossFolderRegions) {
       assert.equal(region.lanes.length, 16);
       assert.deepEqual(
@@ -2099,6 +2100,40 @@ test(
         new Set(region.lanes.map((lane) => lane.linkId)).size,
         16,
         'every crossing link keeps a distinct lane inside its gateway region',
+      );
+
+      const coordinates = region.lanes
+        .map((lane) =>
+          region.side === 'left' || region.side === 'right'
+            ? lane.point.y
+            : lane.point.x,
+        )
+        .sort((left, right) => left - right);
+      assert.equal(
+        new Set(coordinates).size,
+        coordinates.length,
+        'every lane keeps its own distinct physical crossing coordinate, even once converged',
+      );
+      for (let index = 1; index < coordinates.length; index += 1) {
+        const gap = coordinates[index] - coordinates[index - 1];
+        assert.ok(
+          gap > 0 && gap <= 8,
+          `gateway region ${region.id}: lane ${index} sits ${gap}px from its neighbor, expected a small deterministic step instead of an arbitrary gap`,
+        );
+      }
+      const span = coordinates.at(-1) - coordinates[0];
+      const boundaryRect = crossFolderRects[region.folderId];
+      const boundaryLength =
+        region.side === 'left' || region.side === 'right'
+          ? boundaryRect.height
+          : boundaryRect.width;
+      assert.ok(
+        span <= 64,
+        `gateway region ${region.id}: 16 crossing coordinates span ${span}px, expected a converged cluster rather than a spread of individually-placed points`,
+      );
+      assert.ok(
+        span < boundaryLength * 0.15,
+        `gateway region ${region.id}: crossing span ${span}px is not small relative to the ${boundaryLength}px folder boundary it sits on`,
       );
     }
     assert.deepEqual(

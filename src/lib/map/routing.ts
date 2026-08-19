@@ -123,7 +123,7 @@ interface HeapEntry {
 
 const PORT_INSET = 10;
 const PORT_SPACING = 8;
-const GATEWAY_SPACING = 10;
+const GATEWAY_LANE_OFFSET = 4;
 const ROUTE_CLEARANCE = 8;
 const FOLDER_INSET = 4;
 const BEND_COST = 20;
@@ -546,6 +546,27 @@ interface GatewayCrossingMember {
   coordinate: number;
 }
 
+function clusterByGap<T>(
+  items: T[],
+  coordinate: (item: T) => number,
+  gap: number,
+): T[][] {
+  const clusters: T[][] = [];
+  let current: T[] = [];
+
+  for (const item of items) {
+    const previous = current.at(-1);
+    if (previous && coordinate(item) - coordinate(previous) > gap) {
+      clusters.push(current);
+      current = [];
+    }
+    current.push(item);
+  }
+  if (current.length > 0) clusters.push(current);
+
+  return clusters;
+}
+
 export function computeGatewayRegions(
   routes: Record<string, MapRoute>,
 ): MapGatewayRegion[] {
@@ -574,27 +595,14 @@ export function computeGatewayRegions(
         left.coordinate - right.coordinate ||
         compare(left.linkId, right.linkId),
     );
-    let cluster: GatewayCrossingMember[] = [];
-    let regionIndex = 0;
-
-    const flush = () => {
-      if (cluster.length === 0) return;
+    const clusters = clusterByGap(
+      members,
+      (member) => member.coordinate,
+      GATEWAY_REGION_GAP,
+    );
+    clusters.forEach((cluster, regionIndex) => {
       regions.push(buildGatewayRegion(cluster, regionIndex));
-      regionIndex += 1;
-      cluster = [];
-    };
-
-    for (const member of members) {
-      const previous = cluster.at(-1);
-      if (
-        previous &&
-        member.coordinate - previous.coordinate > GATEWAY_REGION_GAP
-      ) {
-        flush();
-      }
-      cluster.push(member);
-    }
-    flush();
+    });
   }
 
   return regions;
@@ -1565,7 +1573,12 @@ function gatewayPoint(
   return pointOnRect(
     rect,
     side,
-    distributedOffset(start + available / 2, available, rank, GATEWAY_SPACING),
+    distributedOffset(
+      start + available / 2,
+      available,
+      rank,
+      GATEWAY_LANE_OFFSET,
+    ),
   );
 }
 
