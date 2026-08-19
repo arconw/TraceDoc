@@ -11,13 +11,90 @@ export interface MapBoundaryGateway {
   folderId: string;
   point: MapPoint;
   side: MapSide;
+  regionId: string;
+  laneIndex: number;
+  laneCount: number;
+}
+
+export interface MapGatewayLane {
+  linkId: string;
+  laneIndex: number;
+  point: MapPoint;
+}
+
+export interface MapGatewayRegion {
+  id: string;
+  folderId: string;
+  side: MapSide;
+  index: number;
+  point: MapPoint;
+  lanes: MapGatewayLane[];
+}
+
+export type MapCorridorAxis = 'horizontal' | 'vertical';
+
+export interface MapCorridorLane {
+  linkId: string;
+  laneIndex: number;
+  direction: MapChevronDirection;
+}
+
+export interface MapCorridor {
+  id: string;
+  axis: MapCorridorAxis;
+  band: { start: number; end: number };
+  extent: { start: number; end: number };
+  lanes: MapCorridorLane[];
+}
+
+export interface MapCorridorAssignment {
+  corridorId: string;
+  axis: MapCorridorAxis;
+  laneIndex: number;
+  laneCount: number;
+  direction: MapChevronDirection;
+}
+
+export interface MapPort {
+  id: string;
+  documentId: string;
+  linkId: string;
+  direction: 'source' | 'target';
+  side: MapSide;
+  index: number;
+  count: number;
+  point: MapPoint;
+  offset: number;
+}
+
+export type MapChevronDirection = 'up' | 'down' | 'left' | 'right';
+
+export interface MapChevron {
+  point: MapPoint;
+  direction: MapChevronDirection;
 }
 
 export interface MapRoute {
   points: MapPoint[];
   sourceSide: MapSide;
   targetSide: MapSide;
+  sourcePort: MapPort;
+  targetPort: MapPort;
   boundaryGateways: MapBoundaryGateway[];
+  chevrons: MapChevron[];
+  crossingGaps: MapPoint[];
+  corridor: MapCorridorAssignment | null;
+}
+
+export interface MapRoutingCost {
+  nodeOverlapCount: number;
+  edgeThroughNodeCount: number;
+  crossingCount: number;
+  ambiguousCorridorCount: number;
+  bendCount: number;
+  totalLength: number;
+  structural: number;
+  total: number;
 }
 
 export interface RoutableMapNode {
@@ -57,12 +134,29 @@ interface HeapEntry {
 
 const PORT_INSET = 10;
 const PORT_SPACING = 8;
-const GATEWAY_SPACING = 10;
+export const GATEWAY_LANE_OFFSET = 10;
 const ROUTE_CLEARANCE = 8;
 const FOLDER_INSET = 4;
 const BEND_COST = 20;
 const SHARED_SEGMENT_COST = 12;
 const GEOMETRY_EPSILON = 1e-6;
+const CHEVRON_MIN_ROUTE_LENGTH = 96;
+const CHEVRON_END_MARGIN = 24;
+const CHEVRON_SPACING = 64;
+const CHEVRON_MAX_COUNT = 5;
+const GATEWAY_REGION_GAP = 40;
+const CORRIDOR_MIN_MEMBERS = 3;
+const CORRIDOR_LANE_GAP = 24;
+const CORRIDOR_MIN_OVERLAP = 32;
+const CORRIDOR_MIN_SEGMENT_LENGTH = 24;
+const CORRIDOR_LANE_OFFSET = 10;
+const AMBIGUOUS_CORRIDOR_GAP = 72;
+const COST_NODE_OVERLAP = 6000;
+const COST_EDGE_THROUGH_NODE = 6000;
+const COST_CROSSING = 150;
+const COST_AMBIGUOUS_CORRIDOR = 120;
+const COST_BEND = 6;
+const COST_LENGTH = 0.02;
 
 export class RouteUnavailableError extends Error {
   constructor(
@@ -105,7 +199,126 @@ export function routeMapLinks(
     }
   }
 
+  const allRects = Object.values(rectangles);
+
+  attachGatewayRegions(routes);
+  attachRoutingCorridors(routes, allRects);
+  for (const route of Object.values(routes)) {
+    route.chevrons = computeRouteChevrons(route.points);
+  }
+  attachCrossingGaps(routes);
+
   return routes;
+}
+
+export function computeRoutingCost(
+  routes: Record<string, MapRoute>,
+  documentRects: Record<string, MapRect>,
+): MapRoutingCost {
+  const nodeOverlapCount = countRectOverlaps(Object.values(documentRects));
+  const edgeThroughNodeCount = countEdgesThroughForeignNodes(
+    routes,
+    documentRects,
+  );
+  const ambiguousCorridorCount = countAmbiguousCorridors(
+    computeRoutingCorridors(routes),
+  );
+  let crossingCount = 0;
+  let bendCount = 0;
+  let totalLength = 0;
+  for (const route of Object.values(routes)) {
+    crossingCount += route.crossingGaps.length;
+    bendCount += Math.max(0, route.points.length - 2);
+    totalLength += routeLength(route.points);
+  }
+
+  const structural =
+    nodeOverlapCount * COST_NODE_OVERLAP +
+    edgeThroughNodeCount * COST_EDGE_THROUGH_NODE +
+    crossingCount * COST_CROSSING +
+    ambiguousCorridorCount * COST_AMBIGUOUS_CORRIDOR;
+  const total = structural + bendCount * COST_BEND + totalLength * COST_LENGTH;
+
+  return {
+    nodeOverlapCount,
+    edgeThroughNodeCount,
+    crossingCount,
+    ambiguousCorridorCount,
+    bendCount,
+    totalLength,
+    structural,
+    total,
+  };
+}
+
+function countRectOverlaps(rects: MapRect[]) {
+  let count = 0;
+  for (let first = 0; first < rects.length; first += 1) {
+    for (let second = first + 1; second < rects.length; second += 1) {
+      if (rectsOverlap(rects[first], rects[second])) count += 1;
+    }
+  }
+  return count;
+}
+
+function rectsOverlap(left: MapRect, right: MapRect) {
+  return (
+    left.x + GEOMETRY_EPSILON < right.x + right.width &&
+    right.x + GEOMETRY_EPSILON < left.x + left.width &&
+    left.y + GEOMETRY_EPSILON < right.y + right.height &&
+    right.y + GEOMETRY_EPSILON < left.y + left.height
+  );
+}
+
+function countEdgesThroughForeignNodes(
+  routes: Record<string, MapRoute>,
+  documentRects: Record<string, MapRect>,
+) {
+  let count = 0;
+  for (const route of Object.values(routes)) {
+    const ownIds = new Set([
+      route.sourcePort.documentId,
+      route.targetPort.documentId,
+    ]);
+    for (const [documentId, rect] of Object.entries(documentRects)) {
+      if (ownIds.has(documentId)) continue;
+      if (routeIntersectsRectInterior(route.points, rect)) count += 1;
+    }
+  }
+  return count;
+}
+
+function routeIntersectsRectInterior(points: MapPoint[], rect: MapRect) {
+  for (let index = 1; index < points.length; index += 1) {
+    if (segmentIntersectsRectInterior(points[index - 1], points[index], rect)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function countAmbiguousCorridors(corridors: MapCorridor[]) {
+  let count = 0;
+  for (let first = 0; first < corridors.length; first += 1) {
+    for (let second = first + 1; second < corridors.length; second += 1) {
+      if (corridorsCompeteForSpace(corridors[first], corridors[second])) {
+        count += 1;
+      }
+    }
+  }
+  return count;
+}
+
+function corridorsCompeteForSpace(left: MapCorridor, right: MapCorridor) {
+  if (left.axis !== right.axis) return false;
+  const gap =
+    Math.max(left.band.start, right.band.start) -
+    Math.min(left.band.end, right.band.end);
+  if (gap < 0 || gap > AMBIGUOUS_CORRIDOR_GAP) return false;
+  const extentOverlap =
+    Math.min(left.extent.end, right.extent.end) -
+    Math.max(left.extent.start, right.extent.start);
+  return extentOverlap >= CORRIDOR_MIN_OVERLAP;
 }
 
 function routeDescriptor(
@@ -116,30 +329,49 @@ function routeDescriptor(
   gatewayGroups: Map<string, RankedMember[]>,
   descriptor: RouteDescriptor,
 ): MapRoute {
+  const sourceRank = rankFor(
+    portGroups,
+    portKey(descriptor.link.sourceDocumentId, descriptor.sourceSide),
+    descriptor.link.id,
+  );
   const sourcePoint = portPoint(
     descriptor.source,
     descriptor.sourceSide,
-    rankFor(
-      portGroups,
-      portKey(descriptor.link.sourceDocumentId, descriptor.sourceSide, true),
-      descriptor.link.id,
-    ),
+    sourceRank,
+  );
+  const sourcePort = buildMapPort(
+    descriptor.link.sourceDocumentId,
+    descriptor.link.id,
+    'source',
+    descriptor.sourceSide,
+    descriptor.source,
+    sourceRank,
+    sourcePoint,
+  );
+  const targetRank = rankFor(
+    portGroups,
+    portKey(descriptor.link.targetDocumentId, descriptor.targetSide),
+    descriptor.link.id,
   );
   const targetPoint = portPoint(
     descriptor.target,
     descriptor.targetSide,
-    rankFor(
-      portGroups,
-      portKey(descriptor.link.targetDocumentId, descriptor.targetSide, false),
-      descriptor.link.id,
-    ),
+    targetRank,
+  );
+  const targetPort = buildMapPort(
+    descriptor.link.targetDocumentId,
+    descriptor.link.id,
+    'target',
+    descriptor.targetSide,
+    descriptor.target,
+    targetRank,
+    targetPoint,
   );
   const points = [sourcePoint];
   const boundaryGateways: MapBoundaryGateway[] = [];
   const reservations: ZoneReservation[] = [];
   let current = movePoint(sourcePoint, descriptor.sourceSide, ROUTE_CLEARANCE);
-  let currentZone =
-    graph.documents[descriptor.link.sourceDocumentId].parentId;
+  let currentZone = graph.documents[descriptor.link.sourceDocumentId].parentId;
   pushPoint(points, current);
 
   try {
@@ -195,7 +427,11 @@ function routeDescriptor(
       currentZone = folderId;
     }
 
-    const targetLead = movePoint(targetPoint, descriptor.targetSide, ROUTE_CLEARANCE);
+    const targetLead = movePoint(
+      targetPoint,
+      descriptor.targetSide,
+      ROUTE_CLEARANCE,
+    );
     appendRoute(
       points,
       routeSegment(zoneRouters[currentZone], current, targetLead, reservations),
@@ -212,11 +448,18 @@ function routeDescriptor(
     throw error;
   }
 
+  const finalPoints = deduplicatePoints(points);
+
   return {
-    points: deduplicatePoints(points),
+    points: finalPoints,
     sourceSide: descriptor.sourceSide,
     targetSide: descriptor.targetSide,
+    sourcePort,
+    targetPort,
     boundaryGateways,
+    chevrons: [],
+    crossingGaps: [],
+    corridor: null,
   };
 }
 
@@ -245,6 +488,668 @@ function reportUnroutableLink(descriptor: RouteDescriptor, error: unknown) {
   console.warn(
     `[map/routing] skipping unroutable link ${descriptor.link.id} (${descriptor.link.sourceDocumentId} -> ${descriptor.link.targetDocumentId}, lca ${descriptor.lcaId}): ${message}`,
   );
+}
+
+function manhattanDistance(source: MapPoint, target: MapPoint) {
+  return Math.abs(target.x - source.x) + Math.abs(target.y - source.y);
+}
+
+function routeLength(points: MapPoint[]) {
+  let total = 0;
+  for (let index = 1; index < points.length; index += 1) {
+    total += manhattanDistance(points[index - 1], points[index]);
+  }
+  return total;
+}
+
+function chevronDirection(from: MapPoint, to: MapPoint): MapChevronDirection {
+  if (from.x === to.x) return to.y > from.y ? 'down' : 'up';
+  return to.x > from.x ? 'right' : 'left';
+}
+
+function pointAlongRoute(points: MapPoint[], distance: number): MapChevron {
+  let remaining = distance;
+  for (let index = 1; index < points.length; index += 1) {
+    const from = points[index - 1];
+    const to = points[index];
+    const length = manhattanDistance(from, to);
+    if (length <= 0) continue;
+    if (remaining <= length) {
+      const fraction = remaining / length;
+      return {
+        point: {
+          x: from.x + (to.x - from.x) * fraction,
+          y: from.y + (to.y - from.y) * fraction,
+        },
+        direction: chevronDirection(from, to),
+      };
+    }
+    remaining -= length;
+  }
+  const last = points.at(-1)!;
+  const beforeLast = points.at(-2) ?? last;
+  return { point: last, direction: chevronDirection(beforeLast, last) };
+}
+
+function computeRouteChevrons(points: MapPoint[]): MapChevron[] {
+  const total = routeLength(points);
+  if (total < CHEVRON_MIN_ROUTE_LENGTH) return [];
+  const usable = total - CHEVRON_END_MARGIN * 2;
+  if (usable <= 0) return [];
+  const count = Math.min(
+    CHEVRON_MAX_COUNT,
+    Math.max(1, Math.floor(usable / CHEVRON_SPACING)),
+  );
+  const chevrons: MapChevron[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const distance = CHEVRON_END_MARGIN + (usable * (index + 1)) / (count + 1);
+    chevrons.push(pointAlongRoute(points, distance));
+  }
+  return chevrons;
+}
+
+function attachCrossingGaps(routes: Record<string, MapRoute>) {
+  const gapsByLink = computeCrossingGaps(routes);
+  for (const [linkId, route] of Object.entries(routes)) {
+    route.crossingGaps = gapsByLink.get(linkId) ?? [];
+  }
+}
+
+function computeCrossingGaps(routes: Record<string, MapRoute>) {
+  const linkIds = Object.keys(routes);
+  const gaps = new Map<string, { point: MapPoint; distance: number }[]>();
+
+  for (let first = 0; first < linkIds.length; first += 1) {
+    for (let second = first + 1; second < linkIds.length; second += 1) {
+      recordRouteCrossings(routes, linkIds[first], linkIds[second], gaps);
+    }
+  }
+
+  const result = new Map<string, MapPoint[]>();
+  for (const [linkId, entries] of gaps) {
+    entries.sort((left, right) => left.distance - right.distance);
+    result.set(linkId, distinctPoints(entries.map((entry) => entry.point)));
+  }
+  return result;
+}
+
+function recordRouteCrossings(
+  routes: Record<string, MapRoute>,
+  firstLinkId: string,
+  secondLinkId: string,
+  gaps: Map<string, { point: MapPoint; distance: number }[]>,
+) {
+  const firstPoints = routes[firstLinkId].points;
+  const secondPoints = routes[secondLinkId].points;
+  let firstDistance = 0;
+
+  for (let firstIndex = 1; firstIndex < firstPoints.length; firstIndex += 1) {
+    const firstStart = firstPoints[firstIndex - 1];
+    const firstEnd = firstPoints[firstIndex];
+    let secondDistance = 0;
+
+    for (
+      let secondIndex = 1;
+      secondIndex < secondPoints.length;
+      secondIndex += 1
+    ) {
+      const secondStart = secondPoints[secondIndex - 1];
+      const secondEnd = secondPoints[secondIndex];
+      const crossing = segmentCrossingPoint(
+        firstStart,
+        firstEnd,
+        secondStart,
+        secondEnd,
+      );
+      if (crossing) {
+        const ownerLinkId = crossing.firstIsHorizontal
+          ? firstLinkId
+          : secondLinkId;
+        const distance = crossing.firstIsHorizontal
+          ? firstDistance + manhattanDistance(firstStart, crossing.point)
+          : secondDistance + manhattanDistance(secondStart, crossing.point);
+        const entries = gaps.get(ownerLinkId) ?? [];
+        entries.push({ point: crossing.point, distance });
+        gaps.set(ownerLinkId, entries);
+      }
+      secondDistance += manhattanDistance(secondStart, secondEnd);
+    }
+    firstDistance += manhattanDistance(firstStart, firstEnd);
+  }
+}
+
+function segmentCrossingPoint(
+  firstStart: MapPoint,
+  firstEnd: MapPoint,
+  secondStart: MapPoint,
+  secondEnd: MapPoint,
+) {
+  const firstIsHorizontal = firstStart.y === firstEnd.y;
+  const secondIsHorizontal = secondStart.y === secondEnd.y;
+  if (firstIsHorizontal === secondIsHorizontal) return null;
+
+  const horizontal = firstIsHorizontal
+    ? { y: firstStart.y, start: firstStart.x, end: firstEnd.x }
+    : { y: secondStart.y, start: secondStart.x, end: secondEnd.x };
+  const vertical = firstIsHorizontal
+    ? { x: secondStart.x, start: secondStart.y, end: secondEnd.y }
+    : { x: firstStart.x, start: firstStart.y, end: firstEnd.y };
+  const horizontalMin = Math.min(horizontal.start, horizontal.end);
+  const horizontalMax = Math.max(horizontal.start, horizontal.end);
+  const verticalMin = Math.min(vertical.start, vertical.end);
+  const verticalMax = Math.max(vertical.start, vertical.end);
+
+  if (
+    vertical.x <= horizontalMin + GEOMETRY_EPSILON ||
+    vertical.x >= horizontalMax - GEOMETRY_EPSILON ||
+    horizontal.y <= verticalMin + GEOMETRY_EPSILON ||
+    horizontal.y >= verticalMax - GEOMETRY_EPSILON
+  ) {
+    return null;
+  }
+
+  return {
+    point: { x: vertical.x, y: horizontal.y },
+    firstIsHorizontal,
+  };
+}
+
+function distinctPoints(points: MapPoint[]) {
+  const seen = new Set<string>();
+  const result: MapPoint[] = [];
+  for (const point of points) {
+    const key = `${point.x},${point.y}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(point);
+  }
+  return result;
+}
+
+interface GatewayCrossingMember {
+  linkId: string;
+  folderId: string;
+  side: MapSide;
+  point: MapPoint;
+  coordinate: number;
+}
+
+function clusterByGap<T>(
+  items: T[],
+  coordinate: (item: T) => number,
+  gap: number,
+): T[][] {
+  const clusters: T[][] = [];
+  let current: T[] = [];
+
+  for (const item of items) {
+    const previous = current.at(-1);
+    if (previous && coordinate(item) - coordinate(previous) > gap) {
+      clusters.push(current);
+      current = [];
+    }
+    current.push(item);
+  }
+  if (current.length > 0) clusters.push(current);
+
+  return clusters;
+}
+
+export function computeGatewayRegions(
+  routes: Record<string, MapRoute>,
+): MapGatewayRegion[] {
+  const byKey = new Map<string, GatewayCrossingMember[]>();
+
+  for (const [linkId, route] of Object.entries(routes)) {
+    for (const gateway of route.boundaryGateways) {
+      const key = gatewayKey(gateway.folderId, gateway.side);
+      const members = byKey.get(key) ?? [];
+      members.push({
+        linkId,
+        folderId: gateway.folderId,
+        side: gateway.side,
+        point: gateway.point,
+        coordinate: perpendicularCoordinate(gateway.side, gateway.point),
+      });
+      byKey.set(key, members);
+    }
+  }
+
+  const regions: MapGatewayRegion[] = [];
+
+  for (const key of [...byKey.keys()].sort(compare)) {
+    const members = [...byKey.get(key)!].sort(
+      (left, right) =>
+        left.coordinate - right.coordinate ||
+        compare(left.linkId, right.linkId),
+    );
+    const clusters = clusterByGap(
+      members,
+      (member) => member.coordinate,
+      GATEWAY_REGION_GAP,
+    );
+    clusters.forEach((cluster, regionIndex) => {
+      regions.push(buildGatewayRegion(cluster, regionIndex));
+    });
+  }
+
+  return regions;
+}
+
+function buildGatewayRegion(
+  members: GatewayCrossingMember[],
+  index: number,
+): MapGatewayRegion {
+  const { folderId, side } = members[0];
+  const lanes: MapGatewayLane[] = members.map((member, laneIndex) => ({
+    linkId: member.linkId,
+    laneIndex,
+    point: member.point,
+  }));
+  const centroid =
+    members.reduce((sum, member) => sum + member.coordinate, 0) /
+    members.length;
+  const point =
+    side === 'left' || side === 'right'
+      ? { x: members[0].point.x, y: centroid }
+      : { x: centroid, y: members[0].point.y };
+
+  return {
+    id: `${folderId}:${side}:${index}`,
+    folderId,
+    side,
+    index,
+    point,
+    lanes,
+  };
+}
+
+function attachGatewayRegions(routes: Record<string, MapRoute>) {
+  const regions = computeGatewayRegions(routes);
+  const byMember = new Map<
+    string,
+    { regionId: string; laneIndex: number; laneCount: number }
+  >();
+
+  for (const region of regions) {
+    for (const lane of region.lanes) {
+      byMember.set(`${region.folderId}:${region.side}:${lane.linkId}`, {
+        regionId: region.id,
+        laneIndex: lane.laneIndex,
+        laneCount: region.lanes.length,
+      });
+    }
+  }
+
+  for (const [linkId, route] of Object.entries(routes)) {
+    for (const gateway of route.boundaryGateways) {
+      const info = byMember.get(
+        `${gateway.folderId}:${gateway.side}:${linkId}`,
+      );
+      if (!info) continue;
+      gateway.regionId = info.regionId;
+      gateway.laneIndex = info.laneIndex;
+      gateway.laneCount = info.laneCount;
+    }
+  }
+}
+
+function pointsEqual(first: MapPoint, second: MapPoint) {
+  return first.x === second.x && first.y === second.y;
+}
+
+function segmentAvoidsInteriors(
+  source: MapPoint,
+  target: MapPoint,
+  obstacles: MapRect[],
+) {
+  return !obstacles.some((rect) =>
+    segmentIntersectsRectInterior(source, target, rect),
+  );
+}
+
+function perpendicularCoordinate(side: MapSide, point: MapPoint) {
+  return side === 'left' || side === 'right' ? point.y : point.x;
+}
+
+interface CorridorCandidate {
+  linkId: string;
+  axis: MapCorridorAxis;
+  perpendicular: number;
+  start: number;
+  end: number;
+  direction: MapChevronDirection;
+  from: MapPoint;
+  to: MapPoint;
+}
+
+interface BuiltCorridor {
+  corridor: MapCorridor;
+  segments: Map<string, CorridorCandidate>;
+}
+
+export function computeRoutingCorridors(
+  routes: Record<string, MapRoute>,
+): MapCorridor[] {
+  return computeBuiltCorridors(routes).map(({ corridor }) => corridor);
+}
+
+function computeBuiltCorridors(
+  routes: Record<string, MapRoute>,
+): BuiltCorridor[] {
+  const candidates = collectCorridorCandidates(routes);
+  const clusters = clusterCorridorCandidates(candidates).filter(
+    (cluster) =>
+      new Set(cluster.map((candidate) => candidate.linkId)).size >=
+      CORRIDOR_MIN_MEMBERS,
+  );
+  const built = clusters.map((cluster) => buildCorridor(cluster));
+
+  built.sort(
+    (left, right) =>
+      (left.corridor.axis === right.corridor.axis
+        ? 0
+        : left.corridor.axis < right.corridor.axis
+          ? -1
+          : 1) ||
+      left.corridor.extent.start - right.corridor.extent.start ||
+      left.corridor.band.start - right.corridor.band.start ||
+      left.corridor.band.end - right.corridor.band.end,
+  );
+
+  return built.map(({ corridor, segments }, index) => ({
+    corridor: { ...corridor, id: `corridor:${corridor.axis}:${index}` },
+    segments,
+  }));
+}
+
+function collectCorridorCandidates(
+  routes: Record<string, MapRoute>,
+): CorridorCandidate[] {
+  const candidates: CorridorCandidate[] = [];
+
+  for (const [linkId, route] of Object.entries(routes)) {
+    for (let index = 1; index < route.points.length; index += 1) {
+      const from = route.points[index - 1];
+      const to = route.points[index];
+      if (from.x === to.x && from.y === to.y) continue;
+      const axis: MapCorridorAxis = from.y === to.y ? 'horizontal' : 'vertical';
+      const start =
+        axis === 'horizontal' ? Math.min(from.x, to.x) : Math.min(from.y, to.y);
+      const end =
+        axis === 'horizontal' ? Math.max(from.x, to.x) : Math.max(from.y, to.y);
+      if (end - start < CORRIDOR_MIN_SEGMENT_LENGTH) continue;
+      candidates.push({
+        linkId,
+        axis,
+        perpendicular: axis === 'horizontal' ? from.y : from.x,
+        start,
+        end,
+        direction: chevronDirection(from, to),
+        from: { x: from.x, y: from.y },
+        to: { x: to.x, y: to.y },
+      });
+    }
+  }
+
+  return candidates;
+}
+
+function corridorCandidatesAdjacent(
+  left: CorridorCandidate,
+  right: CorridorCandidate,
+) {
+  if (left.axis !== right.axis) return false;
+  if (Math.abs(left.perpendicular - right.perpendicular) > CORRIDOR_LANE_GAP) {
+    return false;
+  }
+  const overlap =
+    Math.min(left.end, right.end) - Math.max(left.start, right.start);
+  return overlap >= CORRIDOR_MIN_OVERLAP;
+}
+
+function clusterCorridorCandidates(
+  candidates: CorridorCandidate[],
+): CorridorCandidate[][] {
+  const parent = candidates.map((_, index) => index);
+
+  function find(index: number): number {
+    while (parent[index] !== index) {
+      parent[index] = parent[parent[index]];
+      index = parent[index];
+    }
+    return index;
+  }
+
+  function union(left: number, right: number) {
+    const rootLeft = find(left);
+    const rootRight = find(right);
+    if (rootLeft === rootRight) return;
+    parent[Math.max(rootLeft, rootRight)] = Math.min(rootLeft, rootRight);
+  }
+
+  for (let first = 0; first < candidates.length; first += 1) {
+    for (let second = first + 1; second < candidates.length; second += 1) {
+      if (candidates[first].linkId === candidates[second].linkId) continue;
+      if (!corridorCandidatesAdjacent(candidates[first], candidates[second])) {
+        continue;
+      }
+      union(first, second);
+    }
+  }
+
+  const groups = new Map<number, CorridorCandidate[]>();
+  for (let index = 0; index < candidates.length; index += 1) {
+    const root = find(index);
+    const group = groups.get(root) ?? [];
+    group.push(candidates[index]);
+    groups.set(root, group);
+  }
+
+  return [...groups.entries()]
+    .sort((left, right) => left[0] - right[0])
+    .map(([, group]) => group);
+}
+
+function buildCorridor(candidates: CorridorCandidate[]): BuiltCorridor {
+  const byLink = new Map<string, CorridorCandidate>();
+  for (const candidate of candidates) {
+    const existing = byLink.get(candidate.linkId);
+    if (
+      !existing ||
+      candidate.end - candidate.start > existing.end - existing.start
+    ) {
+      byLink.set(candidate.linkId, candidate);
+    }
+  }
+
+  const members = [...byLink.values()].sort(
+    (left, right) =>
+      left.perpendicular - right.perpendicular ||
+      compare(left.linkId, right.linkId),
+  );
+  const lanes: MapCorridorLane[] = members.map((member, laneIndex) => ({
+    linkId: member.linkId,
+    laneIndex,
+    direction: member.direction,
+  }));
+
+  return {
+    corridor: {
+      id: '',
+      axis: members[0].axis,
+      band: {
+        start: Math.min(...members.map((member) => member.perpendicular)),
+        end: Math.max(...members.map((member) => member.perpendicular)),
+      },
+      extent: {
+        start: Math.min(...members.map((member) => member.start)),
+        end: Math.max(...members.map((member) => member.end)),
+      },
+      lanes,
+    },
+    segments: byLink,
+  };
+}
+
+function attachRoutingCorridors(
+  routes: Record<string, MapRoute>,
+  allRects: MapRect[],
+) {
+  const built = computeBuiltCorridors(routes);
+  const offsetApplied = new Set<string>();
+  for (const { corridor, segments } of built) {
+    for (const lane of corridor.lanes) {
+      const route = routes[lane.linkId];
+      if (!route) continue;
+      route.corridor = {
+        corridorId: corridor.id,
+        axis: corridor.axis,
+        laneIndex: lane.laneIndex,
+        laneCount: corridor.lanes.length,
+        direction: lane.direction,
+      };
+      const segment = segments.get(lane.linkId);
+      if (segment && !offsetApplied.has(lane.linkId)) {
+        const applied = applyCorridorLaneOffset(
+          route,
+          lane.linkId,
+          corridor,
+          lane,
+          segment,
+          allRects,
+          routes,
+        );
+        if (applied) offsetApplied.add(lane.linkId);
+      }
+    }
+  }
+}
+
+function foreignObstacles(
+  allRects: MapRect[],
+  from: MapPoint,
+  to: MapPoint,
+): MapRect[] {
+  return allRects.filter(
+    (rect) =>
+      !(containsPointInclusive(rect, from) && containsPointInclusive(rect, to)),
+  );
+}
+
+function containsPointInclusive(rect: MapRect, point: MapPoint) {
+  return (
+    point.x >= rect.x &&
+    point.x <= rect.x + rect.width &&
+    point.y >= rect.y &&
+    point.y <= rect.y + rect.height
+  );
+}
+
+function applyCorridorLaneOffset(
+  route: MapRoute,
+  linkId: string,
+  corridor: MapCorridor,
+  lane: MapCorridorLane,
+  segment: CorridorCandidate,
+  allRects: MapRect[],
+  routes: Record<string, MapRoute>,
+): boolean {
+  const laneCount = corridor.lanes.length;
+  const delta = (lane.laneIndex - (laneCount - 1) / 2) * CORRIDOR_LANE_OFFSET;
+  if (delta === 0) return false;
+
+  const points = route.points;
+  const index = findSegmentIndex(points, segment.from, segment.to);
+  if (index < 2 || index > points.length - 2) return false;
+
+  const prev = points[index - 2];
+  const next = points[index + 1];
+  if (
+    route.boundaryGateways.some(
+      (gateway) =>
+        pointsEqual(gateway.point, prev) || pointsEqual(gateway.point, next),
+    )
+  ) {
+    return false;
+  }
+
+  const shift = (point: MapPoint): MapPoint =>
+    corridor.axis === 'horizontal'
+      ? { x: point.x, y: point.y + delta }
+      : { x: point.x + delta, y: point.y };
+
+  const newFrom = shift(points[index - 1]);
+  const newTo = shift(points[index]);
+
+  if (!segmentAligned(prev, newFrom) || !segmentAligned(newTo, next)) {
+    return false;
+  }
+  if (pointsEqual(prev, newFrom) || pointsEqual(newTo, next)) return false;
+
+  const obstacles = foreignObstacles(allRects, segment.from, segment.to);
+  const segments: [MapPoint, MapPoint][] = [
+    [prev, newFrom],
+    [newFrom, newTo],
+    [newTo, next],
+  ];
+  if (
+    !segments.every(([from, to]) => segmentAvoidsInteriors(from, to, obstacles))
+  ) {
+    return false;
+  }
+  if (
+    segments.some(([from, to]) =>
+      introducesNewCrossing(from, to, linkId, routes),
+    )
+  ) {
+    return false;
+  }
+
+  points[index - 1] = newFrom;
+  points[index] = newTo;
+  return true;
+}
+
+function introducesNewCrossing(
+  from: MapPoint,
+  to: MapPoint,
+  ownLinkId: string,
+  routes: Record<string, MapRoute>,
+) {
+  for (const [otherLinkId, otherRoute] of Object.entries(routes)) {
+    if (otherLinkId === ownLinkId) continue;
+    const otherPoints = otherRoute.points;
+    for (let index = 1; index < otherPoints.length; index += 1) {
+      if (
+        segmentCrossingPoint(
+          from,
+          to,
+          otherPoints[index - 1],
+          otherPoints[index],
+        )
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function segmentAligned(first: MapPoint, second: MapPoint) {
+  return first.x === second.x || first.y === second.y;
+}
+
+function findSegmentIndex(points: MapPoint[], from: MapPoint, to: MapPoint) {
+  for (let index = 1; index < points.length; index += 1) {
+    if (
+      pointsEqual(points[index - 1], from) &&
+      pointsEqual(points[index], to)
+    ) {
+      return index;
+    }
+  }
+  return -1;
 }
 
 export function segmentIntersectsRectInterior(
@@ -315,7 +1220,7 @@ function descriptorForLink(
   };
 }
 
-function absoluteRectangles(nodes: RoutableMapNode[]) {
+export function absoluteRectangles(nodes: RoutableMapNode[]) {
   const byId = new Map(nodes.map((node) => [node.id, node]));
   const positions = new Map<string, MapPoint>();
 
@@ -472,7 +1377,8 @@ class ZoneRouter {
     for (let yIndex = 0; yIndex < height; yIndex += 1) {
       for (let xIndex = 0; xIndex < width; xIndex += 1) {
         const point = { x: xs[xIndex], y: ys[yIndex] };
-        if (this.pointValid(point, obstacles)) valid[yIndex * width + xIndex] = 1;
+        if (this.pointValid(point, obstacles))
+          valid[yIndex * width + xIndex] = 1;
       }
     }
 
@@ -649,13 +1555,13 @@ function buildPortGroups(descriptors: RouteDescriptor[]) {
   for (const descriptor of descriptors) {
     addRankedMember(
       groups,
-      portKey(descriptor.link.sourceDocumentId, descriptor.sourceSide, true),
+      portKey(descriptor.link.sourceDocumentId, descriptor.sourceSide),
       descriptor.link.id,
       perpendicularCenter(descriptor.target, descriptor.sourceSide),
     );
     addRankedMember(
       groups,
-      portKey(descriptor.link.targetDocumentId, descriptor.targetSide, false),
+      portKey(descriptor.link.targetDocumentId, descriptor.targetSide),
       descriptor.link.id,
       perpendicularCenter(descriptor.source, descriptor.targetSide),
     );
@@ -703,6 +1609,9 @@ function routeGateway(
       side,
       rankFor(groups, gatewayKey(folderId, side), edgeId),
     ),
+    regionId: '',
+    laneIndex: 0,
+    laneCount: 1,
   };
 }
 
@@ -750,6 +1659,36 @@ function portPoint(
   );
 }
 
+function buildMapPort(
+  documentId: string,
+  linkId: string,
+  direction: 'source' | 'target',
+  side: MapSide,
+  rect: MapRect,
+  rank: { index: number; count: number },
+  point: MapPoint,
+): MapPort {
+  return {
+    id: `${documentId}:${side}:${rank.index}`,
+    documentId,
+    linkId,
+    direction,
+    side,
+    index: rank.index,
+    count: rank.count,
+    point,
+    offset: sideOffset(rect, side, point),
+  };
+}
+
+function sideOffset(rect: MapRect, side: MapSide, point: MapPoint) {
+  const horizontalSide = side === 'left' || side === 'right';
+  const length = horizontalSide ? rect.height : rect.width;
+  if (length <= 0) return 0.5;
+  const local = horizontalSide ? point.y - rect.y : point.x - rect.x;
+  return Math.min(1, Math.max(0, local / length));
+}
+
 function gatewayPoint(
   rect: MapRect,
   side: MapSide,
@@ -762,7 +1701,12 @@ function gatewayPoint(
   return pointOnRect(
     rect,
     side,
-    distributedOffset(start + available / 2, available, rank, GATEWAY_SPACING),
+    distributedOffset(
+      start + available / 2,
+      available,
+      rank,
+      GATEWAY_LANE_OFFSET,
+    ),
   );
 }
 
@@ -873,8 +1817,8 @@ function segmentKey(source: MapPoint, target: MapPoint) {
   return `${first.x},${first.y}:${second.x},${second.y}`;
 }
 
-function portKey(documentId: string, side: MapSide, source: boolean) {
-  return `${documentId}:${side}:${source ? 'source' : 'target'}`;
+function portKey(documentId: string, side: MapSide) {
+  return `${documentId}:${side}`;
 }
 
 function gatewayKey(folderId: string, side: MapSide) {

@@ -61,6 +61,7 @@
     mapDocument: MapDocumentNode,
   };
   const edgeTypes = { mapRoute: MapRouteEdge };
+  const ACTIVE_EDGE_Z_INDEX = 3;
 
   interface MapFlowApi {
     fit: () => void;
@@ -135,20 +136,25 @@
           tracedEdge,
           connectedDocumentIds,
         ),
+        activeEdgeId: tracedEdge?.id ?? null,
         onOpenDocument,
         onTraceDocument: traceDocument,
         onTraceDocumentUnmount: traceDocumentUnmount,
       },
     };
   });
-  $: edges = layoutEdges.map((edge): MapFlowEdge => ({
-    ...edge,
-    data: {
-      ...edge.data!,
-      emphasis: edgeEmphasis(edge, tracedDocumentId, tracedEdge),
-      onTracePointerEdge: tracePointerEdge,
-    },
-  }));
+  $: edges = layoutEdges.map((edge): MapFlowEdge => {
+    const emphasis = edgeEmphasis(edge, tracedDocumentId, tracedEdge);
+    return {
+      ...edge,
+      zIndex: emphasis === 'active' ? ACTIVE_EDGE_Z_INDEX : edge.zIndex,
+      data: {
+        ...edge.data!,
+        emphasis,
+        onTracePointerEdge: tracePointerEdge,
+      },
+    };
+  });
   $: traceSummary = tracedEdge
     ? tracedEdge.data!.ariaLabel
     : tracedDocumentId

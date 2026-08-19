@@ -14,6 +14,7 @@
     "lint": "eslint .",
     "lint:rust": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings",
     "test:frontend": "node --test src/lib/stores/project.test.mjs src/lib/stores/project-state.test.mjs src/lib/map/map-graph.test.mjs src/lib/map/viewport-lifecycle.test.mjs src/lib/editor/request-state.test.mjs src/lib/editor/markdown-editing.test.mjs src/lib/editor/rich-markdown.test.mjs src/lib/utils/app-identity.test.mjs src/lib/utils/ui-behavior.test.mjs src/lib/utils/ui-preferences.test.mjs src/lib/styles/theme-contrast.test.mjs",
+    "fixtures:map": "node scripts/generate-map-fixtures.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

@@ -24,8 +24,15 @@ async function loadTypeScript(relativePath) {
 const { mapLayoutSignature, projectToMapGraph } =
   await loadTypeScript('./project-graph.ts');
 const { layoutMapGraph } = await loadTypeScript('./elk-layout.ts');
-const { routeMapLinks, segmentIntersectsRectInterior } =
-  await loadTypeScript('./routing.ts');
+const {
+  routeMapLinks,
+  segmentIntersectsRectInterior,
+  computeRoutingCorridors,
+  computeGatewayRegions,
+  computeRoutingCost,
+  absoluteRectangles: routingAbsoluteRectangles,
+  GATEWAY_LANE_OFFSET,
+} = await loadTypeScript('./routing.ts');
 const {
   beginMapLayout,
   beginQueuedMapLayout,
@@ -50,6 +57,8 @@ const {
   resolveTracedEdge,
   retryQueuedMapLayout,
 } = await loadTypeScript('./map-view-state.ts');
+const { buildFixtureProject, ROUTING_FIXTURES, routingFixtureBySlug } =
+  await loadTypeScript('./routing-fixtures.ts');
 
 test('ignores body-only changes in the map layout signature', () => {
   const project = nestedProject();
@@ -667,15 +676,20 @@ function routableGraph(folders, documents, links) {
   return {
     rootFolderIds: [folders[0].id],
     folders: Object.fromEntries(folders.map((item) => [item.id, item])),
-    documents: Object.fromEntries(
-      documents.map((item) => [item.id, item]),
-    ),
+    documents: Object.fromEntries(documents.map((item) => [item.id, item])),
     links,
   };
 }
 
 function routableDocument(id, parentId, title) {
-  return { id, name: `${id}.md`, title, path: `${id}.md`, parentId, headings: [] };
+  return {
+    id,
+    name: `${id}.md`,
+    title,
+    path: `${id}.md`,
+    parentId,
+    headings: [],
+  };
 }
 
 function routableLink(id, sourceDocumentId, targetDocumentId) {
@@ -989,7 +1003,8 @@ test('rolls back a doomed cross-folder link zone reservations instead of detouri
     ],
     Object.values(graph.documents).filter(
       (document) =>
-        document.id !== 'document:outside' && document.id !== 'document:blocker',
+        document.id !== 'document:outside' &&
+        document.id !== 'document:blocker',
     ),
     [
       routableLink(
@@ -1002,7 +1017,9 @@ test('rolls back a doomed cross-folder link zone reservations instead of detouri
   const baselineNodes = nodes.filter(
     (node) => node.id !== 'document:outside' && node.id !== 'document:blocker',
   );
-  const baselineRoute = routeMapLinks(baselineGraph, baselineNodes)['link:survivor'];
+  const baselineRoute = routeMapLinks(baselineGraph, baselineNodes)[
+    'link:survivor'
+  ];
 
   assert.ok(baselineRoute);
   assert.deepEqual(
@@ -1612,3 +1629,1622 @@ test('does not clear a different document trace from a stale unmount of a previo
   const documentTraceActive = hoveredDocumentId !== null;
   assert.equal(documentTraceActive, true);
 });
+
+function assertRouteGeometry(edge) {
+  assertOrthogonal(edge);
+  for (const point of edge.data.points) {
+    assert.ok(
+      Number.isFinite(point.x) && Number.isFinite(point.y),
+      `${edge.id} has a non-finite coordinate`,
+    );
+  }
+  for (let index = 1; index < edge.data.points.length; index += 1) {
+    const previous = edge.data.points[index - 1];
+    const current = edge.data.points[index];
+    assert.ok(
+      previous.x !== current.x || previous.y !== current.y,
+      `${edge.id} contains a zero-length segment`,
+    );
+  }
+}
+
+const MAP_SIDES = new Set(['top', 'right', 'bottom', 'left']);
+
+function sideFromHandle(handle, prefix) {
+  if (typeof handle !== 'string' || !handle.startsWith(`${prefix}-`)) {
+    return null;
+  }
+  const side = handle.slice(prefix.length + 1).split('-')[0];
+  return MAP_SIDES.has(side) ? side : null;
+}
+
+function movesTowardSide(from, to, side) {
+  if (side === 'left') return to.x < from.x && to.y === from.y;
+  if (side === 'right') return to.x > from.x && to.y === from.y;
+  if (side === 'top') return to.y < from.y && to.x === from.x;
+  return to.y > from.y && to.x === from.x;
+}
+
+function assertValidArrowAndPorts(layout, slug) {
+  for (const edge of layout.edges) {
+    assert.equal(
+      edge.markerEnd?.type,
+      'arrowclosed',
+      `${slug}: ${edge.id} is missing a valid arrow marker`,
+    );
+    const sourceSide = sideFromHandle(edge.sourceHandle, 'source');
+    const targetSide = sideFromHandle(edge.targetHandle, 'target');
+    assert.ok(
+      sourceSide,
+      `${slug}: ${edge.id} has no valid source side handle`,
+    );
+    assert.ok(
+      targetSide,
+      `${slug}: ${edge.id} has no valid target side handle`,
+    );
+    const points = edge.data.points;
+    assert.ok(
+      movesTowardSide(points[0], points[1], sourceSide),
+      `${slug}: ${edge.id} leaves its source in a direction inconsistent with its source handle side`,
+    );
+    assert.ok(
+      movesTowardSide(points.at(-1), points.at(-2), targetSide),
+      `${slug}: ${edge.id} enters its target from a direction inconsistent with its target handle side`,
+    );
+  }
+}
+
+function assertExplicitPortModel(layout, slug) {
+  const groups = new Map();
+
+  for (const edge of layout.edges) {
+    const points = edge.data.points;
+    const endpoints = [
+      ['source', edge.data.sourcePort, points[0], edge.source],
+      ['target', edge.data.targetPort, points.at(-1), edge.target],
+    ];
+
+    for (const [direction, port, expectedPoint, documentId] of endpoints) {
+      assert.ok(port, `${slug}: ${edge.id} is missing its ${direction} port`);
+      assert.equal(
+        port.direction,
+        direction,
+        `${slug}: ${edge.id} ${direction} port has the wrong direction`,
+      );
+      assert.equal(
+        port.documentId,
+        documentId,
+        `${slug}: ${edge.id} ${direction} port documentId does not match its edge endpoint`,
+      );
+      assert.equal(
+        port.linkId,
+        edge.id,
+        `${slug}: ${edge.id} ${direction} port linkId does not match its own edge`,
+      );
+      assert.deepEqual(
+        port.point,
+        expectedPoint,
+        `${slug}: ${edge.id} ${direction} port point does not match its route endpoint`,
+      );
+      assert.ok(
+        port.offset >= 0 && port.offset <= 1,
+        `${slug}: ${edge.id} ${direction} port offset ${port.offset} is out of [0,1]`,
+      );
+      assert.equal(
+        direction === 'source' ? edge.sourceHandle : edge.targetHandle,
+        `${direction}-${port.side}-${port.index}`,
+        `${slug}: ${edge.id} ${direction} handle does not match its own port`,
+      );
+
+      const key = `${port.documentId}:${port.side}`;
+      const group = groups.get(key) ?? new Map();
+      assert.ok(
+        !group.has(port.index),
+        `${slug}: ${key} has two ports sharing index ${port.index}`,
+      );
+      group.set(port.index, port);
+      groups.set(key, group);
+    }
+  }
+
+  for (const [key, group] of groups) {
+    const indices = [...group.keys()].sort((left, right) => left - right);
+    assert.deepEqual(
+      indices,
+      indices.map((_, index) => index),
+      `${slug}: ${key} port indices are not a contiguous 0..count-1 range`,
+    );
+    for (const port of group.values()) {
+      assert.equal(
+        port.count,
+        indices.length,
+        `${slug}: ${key} port count does not match its group size`,
+      );
+    }
+  }
+}
+
+function perpendicularCenter(rect, side) {
+  return side === 'left' || side === 'right'
+    ? rect.y + rect.height / 2
+    : rect.x + rect.width / 2;
+}
+
+function assertSpatialPortOrder(layout, documentId, side, slug) {
+  const rects = absoluteRectangles(layout);
+  const members = [];
+
+  for (const edge of layout.edges) {
+    if (
+      edge.data.sourcePort.documentId === documentId &&
+      edge.data.sourcePort.side === side
+    ) {
+      members.push({
+        index: edge.data.sourcePort.index,
+        center: perpendicularCenter(rects[edge.target], side),
+      });
+    }
+    if (
+      edge.data.targetPort.documentId === documentId &&
+      edge.data.targetPort.side === side
+    ) {
+      members.push({
+        index: edge.data.targetPort.index,
+        center: perpendicularCenter(rects[edge.source], side),
+      });
+    }
+  }
+
+  members.sort((left, right) => left.index - right.index);
+  for (let index = 1; index < members.length; index += 1) {
+    assert.ok(
+      members[index].center >= members[index - 1].center,
+      `${slug}: ${documentId}:${side} ports do not preserve the spatial order of their neighboring documents`,
+    );
+  }
+}
+
+function segmentsCross(sourceA, targetA, sourceB, targetB) {
+  const aHorizontal = sourceA.y === targetA.y;
+  const bHorizontal = sourceB.y === targetB.y;
+  if (aHorizontal === bHorizontal) return false;
+  const horizontal = aHorizontal
+    ? {
+        y: sourceA.y,
+        x1: Math.min(sourceA.x, targetA.x),
+        x2: Math.max(sourceA.x, targetA.x),
+      }
+    : {
+        y: sourceB.y,
+        x1: Math.min(sourceB.x, targetB.x),
+        x2: Math.max(sourceB.x, targetB.x),
+      };
+  const vertical = aHorizontal
+    ? {
+        x: sourceB.x,
+        y1: Math.min(sourceB.y, targetB.y),
+        y2: Math.max(sourceB.y, targetB.y),
+      }
+    : {
+        x: sourceA.x,
+        y1: Math.min(sourceA.y, targetA.y),
+        y2: Math.max(sourceA.y, targetA.y),
+      };
+  return (
+    vertical.x > horizontal.x1 &&
+    vertical.x < horizontal.x2 &&
+    horizontal.y > vertical.y1 &&
+    horizontal.y < vertical.y2
+  );
+}
+
+function countRouteCrossings(edges) {
+  const segments = [];
+  for (const edge of edges) {
+    for (let index = 1; index < edge.data.points.length; index += 1) {
+      segments.push({
+        edgeId: edge.id,
+        source: edge.data.points[index - 1],
+        target: edge.data.points[index],
+      });
+    }
+  }
+  let crossings = 0;
+  for (let first = 0; first < segments.length; first += 1) {
+    for (let second = first + 1; second < segments.length; second += 1) {
+      if (segments[first].edgeId === segments[second].edgeId) continue;
+      if (
+        segmentsCross(
+          segments[first].source,
+          segments[first].target,
+          segments[second].source,
+          segments[second].target,
+        )
+      ) {
+        crossings += 1;
+      }
+    }
+  }
+  return crossings;
+}
+
+function measureLayoutCost(layout) {
+  const routes = {};
+  for (const edge of layout.edges) routes[edge.id] = edge.data;
+  const rectangles = routingAbsoluteRectangles(layout.nodes);
+  const documentRects = {};
+  for (const node of layout.nodes) {
+    if (node.data.kind === 'document')
+      documentRects[node.id] = rectangles[node.id];
+  }
+  return computeRoutingCost(routes, documentRects);
+}
+
+test(
+  'routes every deterministic stress fixture identically twice with finite, orthogonal, interior-safe geometry',
+  { timeout: 120_000 },
+  async (context) => {
+    const started = performance.now();
+    for (const fixture of ROUTING_FIXTURES) {
+      const graph = projectToMapGraph(buildFixtureProject(fixture));
+      const first = await layoutMapGraph(graph, new ELK());
+      const second = await layoutMapGraph(graph, new ELK());
+
+      assert.ok(first.edges.length > 0, `${fixture.slug} produced no edges`);
+      first.edges.forEach(assertRouteGeometry);
+      assertAvoidsDocumentInteriors(first);
+      assertValidArrowAndPorts(first, fixture.slug);
+      assertExplicitPortModel(first, fixture.slug);
+      assert.deepEqual(
+        first.edges.map((edge) => edge.data.points),
+        second.edges.map((edge) => edge.data.points),
+        `${fixture.slug} routed non-deterministically`,
+      );
+      assert.deepEqual(
+        first.edges.map((edge) => [edge.data.sourcePort, edge.data.targetPort]),
+        second.edges.map((edge) => [
+          edge.data.sourcePort,
+          edge.data.targetPort,
+        ]),
+        `${fixture.slug} assigned ports non-deterministically`,
+      );
+      assert.deepEqual(
+        first.nodes.map((node) => [node.id, node.position.x, node.position.y]),
+        second.nodes.map((node) => [node.id, node.position.x, node.position.y]),
+        `${fixture.slug} laid out non-deterministically`,
+      );
+    }
+    context.diagnostic(
+      `${ROUTING_FIXTURES.length} stress fixtures laid out twice in ${(performance.now() - started).toFixed(1)} ms`,
+    );
+    assert.ok(
+      performance.now() - started < 60_000,
+      'stress fixtures exceeded the bounded layout time budget',
+    );
+  },
+);
+
+test(
+  'routes the cross-folder highway and nested fixtures through ordered, hierarchy-correct boundary gateways',
+  { timeout: 60_000 },
+  async () => {
+    for (const slug of [
+      'cross-folder-highway',
+      'nested-to-external',
+      'unrelated-near-corridor',
+    ]) {
+      const fixture = routingFixtureBySlug(slug);
+      const graph = projectToMapGraph(buildFixtureProject(fixture));
+      const layout = await layoutMapGraph(graph, new ELK());
+      assertFolderGatewayPolicy(graph, layout);
+    }
+  },
+);
+
+test(
+  'keeps both directions of the bidirectional corridor as independent, non-merged edges',
+  { timeout: 60_000 },
+  async () => {
+    const fixture = routingFixtureBySlug('bidirectional-corridor');
+    const graph = projectToMapGraph(buildFixtureProject(fixture));
+    const layout = await layoutMapGraph(graph, new ELK());
+
+    assert.equal(layout.edges.length, 20);
+    assert.equal(new Set(layout.edges.map((edge) => edge.id)).size, 20);
+
+    const perPair = new Map();
+    for (const edge of layout.edges) {
+      const key = [edge.source, edge.target].sort().join('|');
+      perPair.set(key, (perPair.get(key) ?? 0) + 1);
+    }
+    assert.ok(
+      [...perPair.values()].every((count) => count === 2),
+      'each left/right pair must keep exactly two independent edges, one per direction',
+    );
+
+    const pointSets = layout.edges.map((edge) =>
+      JSON.stringify(edge.data.points),
+    );
+    assert.equal(
+      new Set(pointSets).size,
+      20,
+      'opposite-direction edges between the same pair must not collapse onto identical geometry',
+    );
+  },
+);
+
+test(
+  'groups dense same-direction and bidirectional traffic into deterministic shared corridors, without absorbing unrelated edges',
+  { timeout: 60_000 },
+  async () => {
+    const denseGraph = projectToMapGraph(
+      buildFixtureProject(routingFixtureBySlug('dense-corridor')),
+    );
+    const denseLayout = await layoutMapGraph(denseGraph, new ELK());
+    const denseRoutes = Object.fromEntries(
+      denseLayout.edges.map((edge) => [edge.id, edge.data]),
+    );
+    const denseCorridors = computeRoutingCorridors(denseRoutes);
+    const denseHighway = denseCorridors.find(
+      (corridor) => corridor.lanes.length === 20,
+    );
+    assert.ok(
+      denseHighway,
+      'the 20 west-to-east links must share one dense corridor',
+    );
+    assert.deepEqual(
+      new Set(denseHighway.lanes.map((lane) => lane.direction)).size,
+      1,
+      'a single-direction corridor must not mix directions',
+    );
+    assert.deepEqual(
+      new Set(denseHighway.lanes.map((lane) => lane.laneIndex)),
+      new Set(Array.from({ length: 20 }, (_, index) => index)),
+      'every member must own a distinct lane index',
+    );
+    assert.equal(
+      new Set(denseHighway.lanes.map((lane) => lane.linkId)).size,
+      20,
+      'every edge keeps its own identity inside the corridor',
+    );
+    assert.deepEqual(
+      computeRoutingCorridors(denseRoutes),
+      computeRoutingCorridors(denseRoutes),
+      'corridor detection must be deterministic across repeated calls',
+    );
+
+    const bidirectionalGraph = projectToMapGraph(
+      buildFixtureProject(routingFixtureBySlug('bidirectional-corridor')),
+    );
+    const bidirectionalLayout = await layoutMapGraph(
+      bidirectionalGraph,
+      new ELK(),
+    );
+    const bidirectionalRoutes = Object.fromEntries(
+      bidirectionalLayout.edges.map((edge) => [edge.id, edge.data]),
+    );
+    const bidirectionalCorridors = computeRoutingCorridors(bidirectionalRoutes);
+    const bidirectionalHighway = bidirectionalCorridors.find(
+      (corridor) => corridor.lanes.length === 20,
+    );
+    assert.ok(
+      bidirectionalHighway,
+      'the 10 left<->right pairs must share one bidirectional corridor',
+    );
+    const bidirectionalDirections = new Set(
+      bidirectionalHighway.lanes.map((lane) => lane.direction),
+    );
+    assert.equal(
+      bidirectionalDirections.size,
+      2,
+      'opposite travel directions must remain distinguishable inside the shared corridor',
+    );
+    assert.equal(
+      new Set(bidirectionalHighway.lanes.map((lane) => lane.linkId)).size,
+      20,
+      'each direction keeps 20 independent lane members, never merged',
+    );
+
+    const crossFolderGraph = projectToMapGraph(
+      buildFixtureProject(routingFixtureBySlug('cross-folder-highway')),
+    );
+    const crossFolderLayout = await layoutMapGraph(crossFolderGraph, new ELK());
+    const crossFolderRoutes = Object.fromEntries(
+      crossFolderLayout.edges.map((edge) => [edge.id, edge.data]),
+    );
+    const crossFolderHighway = computeRoutingCorridors(crossFolderRoutes).find(
+      (corridor) => corridor.lanes.length === 16,
+    );
+    assert.ok(
+      crossFolderHighway,
+      'the 16 frontend-to-backend links must share one cross-folder highway',
+    );
+
+    const noiseGraph = projectToMapGraph(
+      buildFixtureProject(routingFixtureBySlug('unrelated-near-corridor')),
+    );
+    const noiseLayout = await layoutMapGraph(noiseGraph, new ELK());
+    const noiseRoutes = Object.fromEntries(
+      noiseLayout.edges.map((edge) => [edge.id, edge.data]),
+    );
+    const noiseCorridors = computeRoutingCorridors(noiseRoutes);
+    assert.equal(
+      noiseCorridors.length,
+      1,
+      'only the real 5-link corridor may register; the nearby chain must not form a false-positive highway',
+    );
+    assert.equal(noiseCorridors[0].lanes.length, 5);
+    const nearbyLinkIds = new Set(
+      Object.keys(noiseRoutes).filter((linkId) =>
+        noiseRoutes[linkId].sourcePort.documentId.includes('nearby/'),
+      ),
+    );
+    assert.ok(
+      noiseCorridors[0].lanes.every((lane) => !nearbyLinkIds.has(lane.linkId)),
+      'the unrelated nearby chain must never be absorbed into the corridor',
+    );
+  },
+);
+
+test(
+  'produces typed gateway region/lane objects for multi-edge and single-edge folder boundary crossings',
+  { timeout: 60_000 },
+  async () => {
+    const crossFolderGraph = projectToMapGraph(
+      buildFixtureProject(routingFixtureBySlug('cross-folder-highway')),
+    );
+    const crossFolderLayout = await layoutMapGraph(crossFolderGraph, new ELK());
+    const crossFolderRoutes = Object.fromEntries(
+      crossFolderLayout.edges.map((edge) => [edge.id, edge.data]),
+    );
+    const crossFolderRegions = computeGatewayRegions(crossFolderRoutes);
+
+    assert.equal(
+      crossFolderRegions.length,
+      2,
+      'the frontend and backend boundaries each converge through one deterministic gateway region',
+    );
+    const crossFolderRects = absoluteRectangles(crossFolderLayout);
+    for (const region of crossFolderRegions) {
+      assert.equal(region.lanes.length, 16);
+      assert.deepEqual(
+        region.lanes.map((lane) => lane.laneIndex),
+        Array.from({ length: 16 }, (_, index) => index),
+      );
+      assert.equal(
+        new Set(region.lanes.map((lane) => lane.linkId)).size,
+        16,
+        'every crossing link keeps a distinct lane inside its gateway region',
+      );
+
+      const coordinates = region.lanes
+        .map((lane) =>
+          region.side === 'left' || region.side === 'right'
+            ? lane.point.y
+            : lane.point.x,
+        )
+        .sort((left, right) => left - right);
+      assert.equal(
+        new Set(coordinates).size,
+        coordinates.length,
+        'every lane keeps its own distinct physical crossing coordinate, even once converged',
+      );
+      for (let index = 1; index < coordinates.length; index += 1) {
+        const gap = coordinates[index] - coordinates[index - 1];
+        assert.ok(
+          gap > 0 && gap <= GATEWAY_LANE_OFFSET + 4,
+          `gateway region ${region.id}: lane ${index} sits ${gap}px from its neighbor, expected a small deterministic step instead of an arbitrary gap`,
+        );
+      }
+      const span = coordinates.at(-1) - coordinates[0];
+      const boundaryRect = crossFolderRects[region.folderId];
+      const boundaryLength =
+        region.side === 'left' || region.side === 'right'
+          ? boundaryRect.height
+          : boundaryRect.width;
+      assert.ok(
+        span <= (coordinates.length - 1) * GATEWAY_LANE_OFFSET + 4,
+        `gateway region ${region.id}: 16 crossing coordinates span ${span}px, expected a converged cluster rather than a spread of individually-placed points`,
+      );
+      assert.ok(
+        span < boundaryLength * 0.15,
+        `gateway region ${region.id}: crossing span ${span}px is not small relative to the ${boundaryLength}px folder boundary it sits on`,
+      );
+    }
+    assert.deepEqual(
+      computeGatewayRegions(crossFolderRoutes),
+      computeGatewayRegions(crossFolderRoutes),
+      'gateway region assignment must be deterministic across repeated calls',
+    );
+
+    const nestedGraph = projectToMapGraph(
+      buildFixtureProject(routingFixtureBySlug('nested-to-external')),
+    );
+    const nestedLayout = await layoutMapGraph(nestedGraph, new ELK());
+    const nestedRoutes = Object.fromEntries(
+      nestedLayout.edges.map((edge) => [edge.id, edge.data]),
+    );
+    const nestedRegions = computeGatewayRegions(nestedRoutes);
+    const onlyRoute = Object.values(nestedRoutes)[0];
+
+    assert.equal(
+      nestedRegions.length,
+      onlyRoute.boundaryGateways.length,
+      'every boundary crossed by the nested link gets its own single-member gateway region',
+    );
+    assert.ok(
+      nestedRegions.every((region) => region.lanes.length === 1),
+      'a single edge crossing a boundary alone still gets a well-formed, single-lane gateway region',
+    );
+    assert.deepEqual(
+      [...nestedRegions.map((region) => region.folderId)].sort(),
+      [...onlyRoute.boundaryGateways.map((gateway) => gateway.folderId)].sort(),
+      'gateway regions must cover exactly the same boundary crossings the route itself traverses',
+    );
+  },
+);
+
+test(
+  'keeps inbound and outbound lanes on the mixed hub independently ordered, and collision-free combined across both directions',
+  { timeout: 60_000 },
+  async () => {
+    const fixture = routingFixtureBySlug('mixed-hub');
+    const graph = projectToMapGraph(buildFixtureProject(fixture));
+    const layout = await layoutMapGraph(graph, new ELK());
+
+    assert.equal(layout.edges.length, 16);
+    assertExplicitPortModel(layout, 'mixed-hub');
+    const outgoing = layout.edges.filter(
+      (edge) => edge.source === 'document:hub.md',
+    );
+    const incoming = layout.edges.filter(
+      (edge) => edge.target === 'document:hub.md',
+    );
+    assert.equal(outgoing.length, 8);
+    assert.equal(incoming.length, 8);
+    assert.equal(
+      new Set(outgoing.map((edge) => JSON.stringify(edge.data.points[0]))).size,
+      8,
+      'every outgoing edge must land on a distinct point along the hub boundary',
+    );
+    assert.equal(
+      new Set(incoming.map((edge) => JSON.stringify(edge.data.points.at(-1))))
+        .size,
+      8,
+      'every incoming edge must land on a distinct point along the hub boundary',
+    );
+
+    const allHubEndpoints = [
+      ...outgoing.map((edge) => JSON.stringify(edge.data.points[0])),
+      ...incoming.map((edge) => JSON.stringify(edge.data.points.at(-1))),
+    ];
+    assert.equal(
+      new Set(allHubEndpoints).size,
+      16,
+      'every one of the 16 hub endpoints must be distinct across both directions combined: the merged port ranking (routing.ts portKey) must never let an incoming and an outgoing edge share the same physical point on the same side',
+    );
+
+    for (const side of ['top', 'right', 'bottom', 'left']) {
+      assertSpatialPortOrder(layout, 'document:hub.md', side, 'mixed-hub');
+    }
+  },
+);
+
+test(
+  'routes the fan-converge fixture as an organized trunk with distinct per-target ports',
+  { timeout: 60_000 },
+  async (context) => {
+    const fixture = routingFixtureBySlug('fan-converge');
+    const graph = projectToMapGraph(buildFixtureProject(fixture));
+    const layout = await layoutMapGraph(graph, new ELK());
+
+    assert.equal(layout.edges.length, 20);
+    assertExplicitPortModel(layout, 'fan-converge');
+
+    const byTarget = new Map();
+    for (const edge of layout.edges) {
+      const list = byTarget.get(edge.target) ?? [];
+      list.push(edge);
+      byTarget.set(edge.target, list);
+    }
+    assert.equal(
+      byTarget.size,
+      5,
+      'fan-converge must resolve to exactly 5 distinct targets',
+    );
+    for (const [targetId, edges] of byTarget) {
+      assert.equal(
+        edges.length,
+        4,
+        `${targetId} must receive exactly 4 incoming edges`,
+      );
+      assert.equal(
+        new Set(edges.map((edge) => JSON.stringify(edge.data.points.at(-1))))
+          .size,
+        4,
+        `${targetId} must land every incoming edge on a distinct port`,
+      );
+    }
+
+    const crossings = countRouteCrossings(layout.edges);
+    context.diagnostic(
+      `fan-converge fixture: ${crossings} real geometric segment crossings across 20 edges`,
+    );
+    assert.ok(
+      crossings < layout.edges.length,
+      'fan-converge must stay a readable, mostly crossing-free organized trunk rather than a tangle',
+    );
+  },
+);
+
+test(
+  'measures real geometric crossings on the crossing-heavy fixture as a baseline for the later crossing-marker phase',
+  { timeout: 60_000 },
+  async (context) => {
+    const fixture = routingFixtureBySlug('crossing-heavy');
+    const graph = projectToMapGraph(buildFixtureProject(fixture));
+    const layout = await layoutMapGraph(graph, new ELK());
+
+    layout.edges.forEach(assertRouteGeometry);
+    assertAvoidsDocumentInteriors(layout);
+    const crossings = countRouteCrossings(layout.edges);
+    context.diagnostic(
+      `crossing-heavy fixture: ${crossings} real geometric segment crossings across ${layout.edges.length} edges`,
+    );
+    assert.ok(crossings >= 0);
+  },
+);
+
+test(
+  'measures layout stability across the incremental-change fixture pair, confirming the layout/routing feedback pass adds no extra movement when quality is already good',
+  { timeout: 60_000 },
+  async (context) => {
+    const baseGraph = projectToMapGraph(
+      buildFixtureProject(routingFixtureBySlug('incremental-base')),
+    );
+    const nextGraph = projectToMapGraph(
+      buildFixtureProject(routingFixtureBySlug('incremental-next')),
+    );
+
+    const baseLayout = await layoutMapGraph(baseGraph, new ELK());
+    const baseLayoutAgain = await layoutMapGraph(baseGraph, new ELK());
+    assert.deepEqual(
+      baseLayout.nodes.map((node) => [
+        node.id,
+        node.position.x,
+        node.position.y,
+      ]),
+      baseLayoutAgain.nodes.map((node) => [
+        node.id,
+        node.position.x,
+        node.position.y,
+      ]),
+      'the base fixture must lay out identically across repeated runs',
+    );
+
+    const nextLayout = await layoutMapGraph(nextGraph, new ELK());
+    const basePositions = new Map(
+      baseLayout.nodes.map((node) => [node.id, node.position]),
+    );
+    let shared = 0;
+    let unchanged = 0;
+    for (const node of nextLayout.nodes) {
+      const previous = basePositions.get(node.id);
+      if (!previous) continue;
+      shared += 1;
+      if (previous.x === node.position.x && previous.y === node.position.y) {
+        unchanged += 1;
+      }
+    }
+    context.diagnostic(
+      `incremental change: ${unchanged}/${shared} shared node positions unchanged after adding one document and one link`,
+    );
+    assert.ok(shared > 0);
+
+    const baseCost = measureLayoutCost(baseLayout);
+    const nextCost = measureLayoutCost(nextLayout);
+    assert.equal(
+      baseCost.structural,
+      0,
+      'incremental-base must already have zero structural routing cost, so the bounded feedback pass never engages for it',
+    );
+    assert.equal(
+      nextCost.structural,
+      0,
+      'incremental-next must also have zero structural routing cost, so the feedback pass introduces no movement beyond whatever a single ELK pass already produces for this small edit',
+    );
+  },
+);
+
+test(
+  'reduces routing cost through the bounded layout/routing feedback pass on a deliberately poor initial layout',
+  { timeout: 60_000 },
+  async (context) => {
+    const fixture = routingFixtureBySlug('dense-skip-chain');
+    const graph = projectToMapGraph(buildFixtureProject(fixture));
+
+    const singlePass = await layoutMapGraph(graph, new ELK(), {
+      maxIterations: 1,
+    });
+    const feedbackPass = await layoutMapGraph(graph, new ELK());
+    const feedbackPassAgain = await layoutMapGraph(graph, new ELK());
+
+    const singleCost = measureLayoutCost(singlePass);
+    const feedbackCost = measureLayoutCost(feedbackPass);
+
+    context.diagnostic(
+      `dense-skip-chain: single-pass cost ${singleCost.total.toFixed(1)} (structural ${singleCost.structural}, crossings ${singleCost.crossingCount}) vs feedback-pass cost ${feedbackCost.total.toFixed(1)} (structural ${feedbackCost.structural}, crossings ${feedbackCost.crossingCount})`,
+    );
+
+    assert.ok(
+      feedbackCost.total <= singleCost.total,
+      'the bounded feedback pass must never produce a worse routing-quality cost than a single, unadjusted ELK pass',
+    );
+    assert.ok(
+      feedbackCost.structural < singleCost.structural,
+      'the bounded feedback pass must measurably reduce structural routing defects (crossings, overlaps, ambiguous corridors) on a deliberately poor initial layout',
+    );
+
+    assert.deepEqual(
+      feedbackPass.nodes.map((node) => [
+        node.id,
+        node.position.x,
+        node.position.y,
+      ]),
+      feedbackPassAgain.nodes.map((node) => [
+        node.id,
+        node.position.x,
+        node.position.y,
+      ]),
+      'the feedback pass must produce identical node placement across repeated runs of the same graph',
+    );
+    assert.deepEqual(
+      feedbackPass.edges.map((edge) => edge.data.points),
+      feedbackPassAgain.edges.map((edge) => edge.data.points),
+      'the feedback pass must route identically across repeated runs of the same graph',
+    );
+
+    feedbackPass.edges.forEach(assertRouteGeometry);
+    assertAvoidsDocumentInteriors(feedbackPass);
+    assertValidArrowAndPorts(feedbackPass, fixture.slug);
+    assertExplicitPortModel(feedbackPass, fixture.slug);
+  },
+);
+
+function hubCornerFraction(layout, hubId) {
+  const rectangles = routingAbsoluteRectangles(layout.nodes);
+  const documentNodes = layout.nodes.filter(
+    (node) => node.data.kind === 'document',
+  );
+  const ys = documentNodes.map((node) => rectangles[node.id].y);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+  const half = (maxY - minY) / 2;
+  if (half <= 0) return 0;
+  const hubY = rectangles[hubId].y;
+  return Math.abs(hubY - (minY + maxY) / 2) / half;
+}
+
+test(
+  'moves a high-degree hub out of a bad corner through degree-based model-order placement, not spacing alone',
+  { timeout: 60_000 },
+  async (context) => {
+    const fixture = routingFixtureBySlug('hub-in-corner');
+    const graph = projectToMapGraph(buildFixtureProject(fixture));
+    const hubId = 'document:modules/zzz-hub.md';
+
+    const singlePass = await layoutMapGraph(graph, new ELK(), {
+      maxIterations: 1,
+    });
+    const feedbackPass = await layoutMapGraph(graph, new ELK());
+    const feedbackPassAgain = await layoutMapGraph(graph, new ELK());
+
+    const singleCost = measureLayoutCost(singlePass);
+    const feedbackCost = measureLayoutCost(feedbackPass);
+    const singleFraction = hubCornerFraction(singlePass, hubId);
+    const feedbackFraction = hubCornerFraction(feedbackPass, hubId);
+
+    context.diagnostic(
+      `hub-in-corner: single-pass hub corner-distance fraction ${singleFraction.toFixed(2)} (cost ${singleCost.total.toFixed(1)}, structural ${singleCost.structural}) vs feedback-pass fraction ${feedbackFraction.toFixed(2)} (cost ${feedbackCost.total.toFixed(1)}, structural ${feedbackCost.structural})`,
+    );
+
+    assert.ok(
+      singleFraction > 0.9,
+      'fixture setup check: a single unadjusted ELK pass must actually pin the hub at an extreme edge of its layer for this to be a meaningful corner-placement test',
+    );
+    assert.ok(
+      feedbackFraction < singleFraction - 0.3,
+      'the feedback pass must measurably move the hub toward the center of its layer: a purely relative measure like this fraction would not shift from wider spacing alone, so an improvement here is attributable to degree-based model-order placement specifically',
+    );
+    assert.ok(
+      feedbackCost.total <= singleCost.total,
+      'the bounded feedback pass must never produce a worse routing-quality cost than a single, unadjusted ELK pass',
+    );
+    assert.ok(
+      feedbackCost.structural < singleCost.structural,
+      'the bounded feedback pass must measurably reduce structural routing defects caused by the hub being stuck in a corner',
+    );
+
+    assert.deepEqual(
+      feedbackPass.nodes.map((node) => [
+        node.id,
+        node.position.x,
+        node.position.y,
+      ]),
+      feedbackPassAgain.nodes.map((node) => [
+        node.id,
+        node.position.x,
+        node.position.y,
+      ]),
+      'the feedback pass must produce identical node placement across repeated runs of the same graph',
+    );
+    assert.deepEqual(
+      feedbackPass.edges.map((edge) => edge.data.points),
+      feedbackPassAgain.edges.map((edge) => edge.data.points),
+      'the feedback pass must route identically across repeated runs of the same graph',
+    );
+
+    feedbackPass.edges.forEach(assertRouteGeometry);
+    assertAvoidsDocumentInteriors(feedbackPass);
+    assertValidArrowAndPorts(feedbackPass, fixture.slug);
+    assertExplicitPortModel(feedbackPass, fixture.slug);
+  },
+);
+
+function portModelFixture() {
+  const folder = {
+    id: 'folder:zone',
+    name: 'zone',
+    path: 'zone',
+    parentId: null,
+    childFolderIds: [],
+    documentIds: [
+      'document:hub',
+      'document:a',
+      'document:b',
+      'document:c',
+      'document:d',
+    ],
+  };
+  const documents = [
+    routableDocument('document:hub', folder.id, 'Hub'),
+    routableDocument('document:a', folder.id, 'A'),
+    routableDocument('document:b', folder.id, 'B'),
+    routableDocument('document:c', folder.id, 'C'),
+    routableDocument('document:d', folder.id, 'D'),
+  ];
+  // A, B, and C each link into the hub (target role); the hub links out to D
+  // (source role). A, B, C, and D sit, top to bottom, on the same side of
+  // the hub, so all four edges compete for the same physical side and must
+  // be ranked into one merged, direction-independent sequence.
+  const links = [
+    routableLink('link:a', 'document:a', 'document:hub'),
+    routableLink('link:b', 'document:b', 'document:hub'),
+    routableLink('link:c', 'document:c', 'document:hub'),
+    routableLink('link:d', 'document:hub', 'document:d'),
+  ];
+  const graph = routableGraph([folder], documents, links);
+  const nodes = [
+    {
+      id: folder.id,
+      position: { x: 0, y: 0 },
+      width: 600,
+      height: 420,
+      data: { kind: 'folder' },
+    },
+    {
+      id: 'document:hub',
+      parentId: folder.id,
+      position: { x: 300, y: 150 },
+      width: 100,
+      height: 50,
+      data: { kind: 'document' },
+    },
+    {
+      id: 'document:a',
+      parentId: folder.id,
+      position: { x: 20, y: 20 },
+      width: 100,
+      height: 50,
+      data: { kind: 'document' },
+    },
+    {
+      id: 'document:b',
+      parentId: folder.id,
+      position: { x: 20, y: 120 },
+      width: 100,
+      height: 50,
+      data: { kind: 'document' },
+    },
+    {
+      id: 'document:c',
+      parentId: folder.id,
+      position: { x: 20, y: 220 },
+      width: 100,
+      height: 50,
+      data: { kind: 'document' },
+    },
+    {
+      id: 'document:d',
+      parentId: folder.id,
+      position: { x: 20, y: 320 },
+      width: 100,
+      height: 50,
+      data: { kind: 'document' },
+    },
+  ];
+  return { graph, nodes };
+}
+
+test('assigns an explicit, structured port model to every route endpoint', () => {
+  const { graph, nodes } = portModelFixture();
+  const first = routeMapLinks(graph, nodes);
+  const second = routeMapLinks(graph, nodes);
+
+  assert.deepEqual(first, second, 'port assignment must be deterministic');
+
+  for (const linkId of ['link:a', 'link:b', 'link:c', 'link:d']) {
+    const route = first[linkId];
+    assert.ok(route, `${linkId} did not route`);
+    for (const [direction, port] of [
+      ['source', route.sourcePort],
+      ['target', route.targetPort],
+    ]) {
+      assert.equal(typeof port.id, 'string');
+      assert.equal(port.direction, direction);
+      assert.equal(port.linkId, linkId);
+      assert.ok(Number.isInteger(port.index) && port.index >= 0);
+      assert.ok(Number.isInteger(port.count) && port.count >= 1);
+      assert.ok(port.offset >= 0 && port.offset <= 1);
+    }
+  }
+
+  assert.equal(first['link:a'].sourcePort.direction, 'source');
+  assert.equal(first['link:a'].targetPort.direction, 'target');
+  assert.equal(first['link:a'].targetPort.documentId, 'document:hub');
+  assert.equal(first['link:d'].sourcePort.documentId, 'document:hub');
+
+  // A, B, C (target-role) and D (source-role, via the hub's outgoing edge)
+  // all land on the hub's left side, so this is exactly the mixed-direction
+  // congestion the merged port ranking must resolve.
+  const hubLeftPorts = [
+    first['link:a'].targetPort,
+    first['link:b'].targetPort,
+    first['link:c'].targetPort,
+    first['link:d'].sourcePort,
+  ];
+  assert.ok(
+    hubLeftPorts.every((port) => port.side === 'left'),
+    'fixture setup expected all four edges on the hub’s left side',
+  );
+  assert.equal(
+    new Set(hubLeftPorts.map((port) => port.index)).size,
+    4,
+    'every edge on the hub’s left side must have a distinct index regardless of direction',
+  );
+  assert.ok(
+    hubLeftPorts.every((port) => port.count === 4),
+    'every port sharing the hub’s left side must report the same total count',
+  );
+  assert.deepEqual(
+    [...hubLeftPorts].sort((left, right) => left.index - right.index),
+    hubLeftPorts,
+    'A, B, C, D were declared in their spatial (top-to-bottom) order, so ranked index order must already match',
+  );
+
+  const layout = {
+    nodes,
+    edges: Object.keys(first).map((linkId) => ({
+      id: linkId,
+      source: graph.links.find((link) => link.id === linkId).sourceDocumentId,
+      target: graph.links.find((link) => link.id === linkId).targetDocumentId,
+      data: first[linkId],
+    })),
+  };
+  assertSpatialPortOrder(layout, 'document:hub', 'left', 'port-model');
+});
+
+function rectNode(id, parentId, x, y, width, height) {
+  return {
+    id,
+    parentId,
+    position: { x, y },
+    width,
+    height,
+    data: { kind: 'document' },
+  };
+}
+
+function chevronRouteFixture() {
+  const folder = {
+    id: 'folder:chevron-zone',
+    name: 'chevron-zone',
+    path: 'chevron-zone',
+    parentId: null,
+    childFolderIds: [],
+    documentIds: [
+      'document:short-a',
+      'document:short-b',
+      'document:medium-a',
+      'document:medium-b',
+      'document:long-a',
+      'document:long-b',
+      'document:vertical-a',
+      'document:vertical-b',
+      'document:bend-a',
+      'document:bend-b',
+    ],
+  };
+  const documents = folder.documentIds.map((id) =>
+    routableDocument(id, folder.id, id),
+  );
+  const graph = routableGraph([folder], documents, [
+    routableLink('link:short', 'document:short-a', 'document:short-b'),
+    routableLink('link:medium', 'document:medium-a', 'document:medium-b'),
+    routableLink('link:long', 'document:long-a', 'document:long-b'),
+    routableLink('link:vertical', 'document:vertical-a', 'document:vertical-b'),
+    routableLink('link:bend', 'document:bend-a', 'document:bend-b'),
+  ]);
+  const nodes = [
+    {
+      id: folder.id,
+      position: { x: 0, y: 0 },
+      width: 4200,
+      height: 900,
+      data: { kind: 'folder' },
+    },
+    // A short adjacent pair: the route is well under the chevron minimum
+    // length, so it must render none.
+    rectNode('document:short-a', folder.id, 0, 0, 60, 30),
+    rectNode('document:short-b', folder.id, 80, 0, 60, 30),
+    // A moderate horizontal gap: long enough for a few chevrons.
+    rectNode('document:medium-a', folder.id, 0, 200, 60, 30),
+    rectNode('document:medium-b', folder.id, 300, 200, 60, 30),
+    // A very long horizontal gap: chevron count must stay restrained
+    // rather than growing without bound.
+    rectNode('document:long-a', folder.id, 0, 400, 60, 30),
+    rectNode('document:long-b', folder.id, 3000, 400, 60, 30),
+    // A tall vertical pair, isolated in its own lane.
+    rectNode('document:vertical-a', folder.id, 3200, 0, 60, 30),
+    rectNode('document:vertical-b', folder.id, 3200, 700, 60, 30),
+    // Offset both horizontally and vertically so the router cannot take
+    // the direct single-segment fast path and must bend.
+    rectNode('document:bend-a', folder.id, 3400, 0, 60, 30),
+    rectNode('document:bend-b', folder.id, 3900, 300, 60, 30),
+  ];
+  return { graph, nodes };
+}
+
+function chevronMatchesSegment(points, chevron) {
+  for (let index = 1; index < points.length; index += 1) {
+    const from = points[index - 1];
+    const to = points[index];
+    const onSegment =
+      from.x === to.x
+        ? Math.abs(chevron.point.x - from.x) < 1e-6 &&
+          chevron.point.y >= Math.min(from.y, to.y) - 1e-6 &&
+          chevron.point.y <= Math.max(from.y, to.y) + 1e-6
+        : Math.abs(chevron.point.y - from.y) < 1e-6 &&
+          chevron.point.x >= Math.min(from.x, to.x) - 1e-6 &&
+          chevron.point.x <= Math.max(from.x, to.x) + 1e-6;
+    if (!onSegment) continue;
+    const expectedDirection =
+      from.x === to.x
+        ? to.y > from.y
+          ? 'down'
+          : 'up'
+        : to.x > from.x
+          ? 'right'
+          : 'left';
+    return chevron.direction === expectedDirection;
+  }
+  return false;
+}
+
+test('renders directional chevrons along each route, scaled by length and restrained on very long routes', () => {
+  const { graph, nodes } = chevronRouteFixture();
+  const routes = routeMapLinks(graph, nodes);
+  const short = routes['link:short'];
+  const medium = routes['link:medium'];
+  const long = routes['link:long'];
+  const vertical = routes['link:vertical'];
+  const bend = routes['link:bend'];
+
+  assert.ok(
+    short && medium && long && vertical && bend,
+    'fixture links must all route',
+  );
+
+  assert.equal(
+    short.chevrons.length,
+    0,
+    'a route too short to need one must render no intermediate chevrons',
+  );
+  assert.ok(
+    medium.chevrons.length > 0,
+    'a sufficiently long route must render at least one chevron',
+  );
+  assert.ok(
+    long.chevrons.length >= medium.chevrons.length,
+    'a longer route must never render fewer chevrons than a shorter one',
+  );
+  assert.ok(
+    long.chevrons.length <= 8,
+    'chevron count must stay restrained rather than growing into a decorative chain on a very long route',
+  );
+
+  for (const route of [medium, long, vertical, bend]) {
+    for (const chevron of route.chevrons) {
+      assert.ok(
+        chevronMatchesSegment(route.points, chevron),
+        `chevron at ${JSON.stringify(chevron.point)} does not match the direction of its own route segment`,
+      );
+    }
+  }
+
+  assert.ok(
+    long.chevrons.every((chevron) => chevron.direction === 'right'),
+    'a purely horizontal route must render only right-facing chevrons',
+  );
+  assert.ok(
+    vertical.chevrons.length > 0 &&
+      vertical.chevrons.every((chevron) => chevron.direction === 'down'),
+    'a purely vertical route must render only down-facing chevrons',
+  );
+  assert.ok(
+    bend.points.length > 2,
+    'the bend fixture must actually produce a multi-segment route',
+  );
+  assert.ok(
+    bend.chevrons.length > 0,
+    'a long, bent route must still render chevrons across its bend',
+  );
+});
+
+function assertCrossingGapsAreInterior(routes) {
+  const endpoints = new Set();
+  for (const route of routes) {
+    for (const point of route.points) endpoints.add(`${point.x},${point.y}`);
+  }
+  for (const route of routes) {
+    for (const gap of route.crossingGaps) {
+      assert.equal(
+        endpoints.has(`${gap.x},${gap.y}`),
+        false,
+        'a crossing gap must never land exactly on a route endpoint, port, or corner - that would read as a genuine junction rather than a mere crossing',
+      );
+    }
+  }
+}
+
+function crossingFixture() {
+  const folder = {
+    id: 'folder:crossing-pair',
+    name: 'crossing-pair',
+    path: 'crossing-pair',
+    parentId: null,
+    childFolderIds: [],
+    documentIds: [
+      'document:left',
+      'document:right',
+      'document:top',
+      'document:bottom',
+    ],
+  };
+  const documents = folder.documentIds.map((id) =>
+    routableDocument(id, folder.id, id),
+  );
+  const graph = routableGraph([folder], documents, [
+    routableLink('link:horizontal', 'document:left', 'document:right'),
+    routableLink('link:vertical', 'document:top', 'document:bottom'),
+  ]);
+  const nodes = [
+    {
+      id: folder.id,
+      position: { x: 0, y: 0 },
+      width: 500,
+      height: 400,
+      data: { kind: 'folder' },
+    },
+    rectNode('document:left', folder.id, 20, 100, 60, 30),
+    rectNode('document:right', folder.id, 420, 100, 60, 30),
+    rectNode('document:top', folder.id, 220, 10, 60, 30),
+    rectNode('document:bottom', folder.id, 220, 340, 60, 30),
+  ];
+  return { graph, nodes };
+}
+
+function multiCrossingFixture() {
+  const folder = {
+    id: 'folder:crossing-grid',
+    name: 'crossing-grid',
+    path: 'crossing-grid',
+    parentId: null,
+    childFolderIds: [],
+    documentIds: [
+      'document:row-a-left',
+      'document:row-a-right',
+      'document:row-b-left',
+      'document:row-b-right',
+      'document:column-a-top',
+      'document:column-a-bottom',
+      'document:column-b-top',
+      'document:column-b-bottom',
+    ],
+  };
+  const documents = folder.documentIds.map((id) =>
+    routableDocument(id, folder.id, id),
+  );
+  const graph = routableGraph([folder], documents, [
+    routableLink('link:row-a', 'document:row-a-left', 'document:row-a-right'),
+    routableLink('link:row-b', 'document:row-b-left', 'document:row-b-right'),
+    routableLink(
+      'link:column-a',
+      'document:column-a-top',
+      'document:column-a-bottom',
+    ),
+    routableLink(
+      'link:column-b',
+      'document:column-b-top',
+      'document:column-b-bottom',
+    ),
+  ]);
+  const nodes = [
+    {
+      id: folder.id,
+      position: { x: 0, y: 0 },
+      width: 700,
+      height: 700,
+      data: { kind: 'folder' },
+    },
+    rectNode('document:row-a-left', folder.id, 20, 130, 60, 30),
+    rectNode('document:row-a-right', folder.id, 620, 130, 60, 30),
+    rectNode('document:row-b-left', folder.id, 20, 430, 60, 30),
+    rectNode('document:row-b-right', folder.id, 620, 430, 60, 30),
+    rectNode('document:column-a-top', folder.id, 230, 10, 60, 30),
+    rectNode('document:column-a-bottom', folder.id, 230, 640, 60, 30),
+    rectNode('document:column-b-top', folder.id, 480, 10, 60, 30),
+    rectNode('document:column-b-bottom', folder.id, 480, 640, 60, 30),
+  ];
+  return { graph, nodes };
+}
+
+test(
+  'marks a crossing indicator only where two independent routes truly cross geometrically',
+  { timeout: 60_000 },
+  async () => {
+    const { graph: pairGraph, nodes: pairNodes } = crossingFixture();
+    const pairRoutes = routeMapLinks(pairGraph, pairNodes);
+    const horizontal = pairRoutes['link:horizontal'];
+    const vertical = pairRoutes['link:vertical'];
+
+    assert.ok(horizontal && vertical, 'both crossing links must route');
+    assertOrthogonalPoints(horizontal.points);
+    assertOrthogonalPoints(vertical.points);
+    assert.equal(
+      horizontal.crossingGaps.length,
+      1,
+      'the edge whose segment is horizontal at the crossing owns the gap',
+    );
+    assert.equal(
+      vertical.crossingGaps.length,
+      0,
+      'the crossing vertical edge must stay visually continuous through the intersection',
+    );
+    assertCrossingGapsAreInterior(Object.values(pairRoutes));
+
+    const { graph: gridGraph, nodes: gridNodes } = multiCrossingFixture();
+    const gridRoutes = routeMapLinks(gridGraph, gridNodes);
+    const rowA = gridRoutes['link:row-a'];
+    const rowB = gridRoutes['link:row-b'];
+    const columnA = gridRoutes['link:column-a'];
+    const columnB = gridRoutes['link:column-b'];
+
+    assert.ok(rowA && rowB && columnA && columnB, 'every grid link must route');
+    assert.equal(
+      rowA.crossingGaps.length,
+      2,
+      'row A crosses both columns and owns both gaps',
+    );
+    assert.equal(
+      rowB.crossingGaps.length,
+      2,
+      'row B crosses both columns and owns both gaps',
+    );
+    assert.equal(
+      columnA.crossingGaps.length,
+      0,
+      'a vertical edge never owns a gap under the horizontal-owns-the-gap convention',
+    );
+    assert.equal(
+      columnB.crossingGaps.length,
+      0,
+      'a vertical edge never owns a gap under the horizontal-owns-the-gap convention',
+    );
+    assertCrossingGapsAreInterior(Object.values(gridRoutes));
+
+    // No accidental "junction" marker: across every deterministic stress
+    // fixture (TraceDoc's edges are independent - no fixture models a real
+    // shared connection point between two different links), no crossing
+    // gap may ever land on another route's endpoint/corner, which is the
+    // only way a mere crossing could be mistaken for a genuine junction.
+    for (const fixture of ROUTING_FIXTURES) {
+      const graph = projectToMapGraph(buildFixtureProject(fixture));
+      const layout = await layoutMapGraph(graph, new ELK());
+      assertCrossingGapsAreInterior(layout.edges.map((edge) => edge.data));
+    }
+  },
+);
+
+function highwayCrossingFixture() {
+  const rowCount = 4;
+  const folder = {
+    id: 'folder:highway-crossing',
+    name: 'highway-crossing',
+    path: 'highway-crossing',
+    parentId: null,
+    childFolderIds: [],
+    documentIds: [
+      ...Array.from(
+        { length: rowCount },
+        (_, index) => `document:row-${index}-left`,
+      ),
+      ...Array.from(
+        { length: rowCount },
+        (_, index) => `document:row-${index}-right`,
+      ),
+      'document:crosser-top',
+      'document:crosser-bottom',
+    ],
+  };
+  const documents = folder.documentIds.map((id) =>
+    routableDocument(id, folder.id, id),
+  );
+  const rowLinks = Array.from({ length: rowCount }, (_, index) =>
+    routableLink(
+      `link:row-${index}`,
+      `document:row-${index}-left`,
+      `document:row-${index}-right`,
+    ),
+  );
+  const graph = routableGraph([folder], documents, [
+    ...rowLinks,
+    routableLink(
+      'link:crosser',
+      'document:crosser-top',
+      'document:crosser-bottom',
+    ),
+  ]);
+  const nodes = [
+    {
+      id: folder.id,
+      position: { x: 0, y: 0 },
+      width: 750,
+      height: 300,
+      data: { kind: 'folder' },
+    },
+    ...Array.from({ length: rowCount }, (_, index) =>
+      rectNode(
+        `document:row-${index}-left`,
+        folder.id,
+        20,
+        100 + index * 20,
+        60,
+        16,
+      ),
+    ),
+    ...Array.from({ length: rowCount }, (_, index) =>
+      rectNode(
+        `document:row-${index}-right`,
+        folder.id,
+        620,
+        100 + index * 20,
+        60,
+        16,
+      ),
+    ),
+    rectNode('document:crosser-top', folder.id, 300, 10, 20, 20),
+    rectNode('document:crosser-bottom', folder.id, 300, 250, 20, 20),
+  ];
+  return { graph, nodes, rowCount };
+}
+
+test(
+  'marks a crossing indicator for a crossing occurring inside a shared highway lane area',
+  { timeout: 60_000 },
+  () => {
+    const { graph, nodes, rowCount } = highwayCrossingFixture();
+    const routes = routeMapLinks(graph, nodes);
+    const rowIds = Array.from(
+      { length: rowCount },
+      (_, index) => `link:row-${index}`,
+    );
+    const rowRoutes = rowIds.map((id) => routes[id]);
+    const crosser = routes['link:crosser'];
+
+    assert.ok(
+      rowRoutes.every(Boolean) && crosser,
+      'every highway lane and the crosser link must route',
+    );
+    assert.ok(
+      rowRoutes.every((route) => route.corridor),
+      'every parallel row edge must join the shared highway corridor',
+    );
+    assert.equal(
+      new Set(rowRoutes.map((route) => route.corridor.corridorId)).size,
+      1,
+      'all rows must share exactly one corridor',
+    );
+    assert.deepEqual(
+      [...rowRoutes.map((route) => route.corridor.laneIndex)].sort(
+        (left, right) => left - right,
+      ),
+      [0, 1, 2, 3],
+      'lane assignment inside the highway must be deterministic and distinct',
+    );
+    assert.equal(
+      crosser.corridor,
+      null,
+      'a lone perpendicular crosser must not itself join the parallel highway',
+    );
+
+    for (const route of rowRoutes) {
+      assert.equal(
+        route.crossingGaps.length,
+        1,
+        'each highway lane must still carry its own crossing gap where the perpendicular edge crosses it',
+      );
+    }
+    assert.equal(
+      crosser.crossingGaps.length,
+      0,
+      'the crossing edge stays visually continuous through the highway, matching the horizontal-owns-the-gap convention',
+    );
+    assertCrossingGapsAreInterior(Object.values(routes));
+  },
+);
+
+function corridorThresholdFixture() {
+  const realCount = 3;
+  const noiseCount = 2;
+  const folder = {
+    id: 'folder:corridor-threshold',
+    name: 'corridor-threshold',
+    path: 'corridor-threshold',
+    parentId: null,
+    childFolderIds: [],
+    documentIds: [
+      ...Array.from(
+        { length: realCount },
+        (_, index) => `document:real-${index}-left`,
+      ),
+      ...Array.from(
+        { length: realCount },
+        (_, index) => `document:real-${index}-right`,
+      ),
+      ...Array.from(
+        { length: noiseCount },
+        (_, index) => `document:noise-${index}-left`,
+      ),
+      ...Array.from(
+        { length: noiseCount },
+        (_, index) => `document:noise-${index}-right`,
+      ),
+    ],
+  };
+  const documents = folder.documentIds.map((id) =>
+    routableDocument(id, folder.id, id),
+  );
+  const realLinks = Array.from({ length: realCount }, (_, index) =>
+    routableLink(
+      `link:real-${index}`,
+      `document:real-${index}-left`,
+      `document:real-${index}-right`,
+    ),
+  );
+  const noiseLinks = Array.from({ length: noiseCount }, (_, index) =>
+    routableLink(
+      `link:noise-${index}`,
+      `document:noise-${index}-left`,
+      `document:noise-${index}-right`,
+    ),
+  );
+  const graph = routableGraph([folder], documents, [
+    ...realLinks,
+    ...noiseLinks,
+  ]);
+  const nodes = [
+    {
+      id: folder.id,
+      position: { x: 0, y: 0 },
+      width: 750,
+      height: 380,
+      data: { kind: 'folder' },
+    },
+    ...Array.from({ length: realCount }, (_, index) =>
+      rectNode(
+        `document:real-${index}-left`,
+        folder.id,
+        20,
+        100 + index * 20,
+        60,
+        16,
+      ),
+    ),
+    ...Array.from({ length: realCount }, (_, index) =>
+      rectNode(
+        `document:real-${index}-right`,
+        folder.id,
+        620,
+        100 + index * 20,
+        60,
+        16,
+      ),
+    ),
+    ...Array.from({ length: noiseCount }, (_, index) =>
+      rectNode(
+        `document:noise-${index}-left`,
+        folder.id,
+        20,
+        300 + index * 20,
+        60,
+        16,
+      ),
+    ),
+    ...Array.from({ length: noiseCount }, (_, index) =>
+      rectNode(
+        `document:noise-${index}-right`,
+        folder.id,
+        620,
+        300 + index * 20,
+        60,
+        16,
+      ),
+    ),
+  ];
+  return { graph, nodes, realCount, noiseCount };
+}
+
+test(
+  'requires at least CORRIDOR_MIN_MEMBERS parallel edges before they cluster into a corridor',
+  { timeout: 60_000 },
+  () => {
+    const { graph, nodes, realCount } = corridorThresholdFixture();
+    const routes = routeMapLinks(graph, nodes);
+    const realRoutes = Array.from(
+      { length: realCount },
+      (_, index) => routes[`link:real-${index}`],
+    );
+    const noiseRoutes = [routes['link:noise-0'], routes['link:noise-1']];
+
+    assert.ok(
+      realRoutes.every(Boolean) && noiseRoutes.every(Boolean),
+      'every fixture link must route',
+    );
+    assert.ok(
+      realRoutes.every((route) => route.corridor !== null),
+      'a dense group at or above CORRIDOR_MIN_MEMBERS must cluster into a corridor',
+    );
+    assert.equal(
+      new Set(realRoutes.map((route) => route.corridor.corridorId)).size,
+      1,
+      'the real group must share exactly one corridor',
+    );
+    assert.deepEqual(
+      [...realRoutes.map((route) => route.corridor.laneIndex)].sort(
+        (left, right) => left - right,
+      ),
+      Array.from({ length: realCount }, (_, index) => index),
+      'the real group keeps distinct, deterministic lane indexes',
+    );
+    assert.ok(
+      noiseRoutes.every((route) => route.corridor === null),
+      'two coincidentally parallel short edges below CORRIDOR_MIN_MEMBERS must never cluster into a corridor',
+    );
+    assert.equal(
+      computeRoutingCorridors(routes).length,
+      1,
+      'only the real, at-threshold group may register as a corridor',
+    );
+  },
+);
