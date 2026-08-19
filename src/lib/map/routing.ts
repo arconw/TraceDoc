@@ -86,6 +86,17 @@ export interface MapRoute {
   corridor: MapCorridorAssignment | null;
 }
 
+export interface MapRoutingCost {
+  nodeOverlapCount: number;
+  edgeThroughNodeCount: number;
+  crossingCount: number;
+  ambiguousCorridorCount: number;
+  bendCount: number;
+  totalLength: number;
+  structural: number;
+  total: number;
+}
+
 export interface RoutableMapNode {
   id: string;
   parentId?: string;
@@ -139,6 +150,13 @@ const CORRIDOR_LANE_GAP = 24;
 const CORRIDOR_MIN_OVERLAP = 32;
 const CORRIDOR_MIN_SEGMENT_LENGTH = 24;
 const CORRIDOR_LANE_OFFSET = 4;
+const AMBIGUOUS_CORRIDOR_GAP = 72;
+const COST_NODE_OVERLAP = 6000;
+const COST_EDGE_THROUGH_NODE = 6000;
+const COST_CROSSING = 150;
+const COST_AMBIGUOUS_CORRIDOR = 120;
+const COST_BEND = 6;
+const COST_LENGTH = 0.02;
 
 export class RouteUnavailableError extends Error {
   constructor(
@@ -191,6 +209,116 @@ export function routeMapLinks(
   attachCrossingGaps(routes);
 
   return routes;
+}
+
+export function computeRoutingCost(
+  routes: Record<string, MapRoute>,
+  documentRects: Record<string, MapRect>,
+): MapRoutingCost {
+  const nodeOverlapCount = countRectOverlaps(Object.values(documentRects));
+  const edgeThroughNodeCount = countEdgesThroughForeignNodes(
+    routes,
+    documentRects,
+  );
+  const ambiguousCorridorCount = countAmbiguousCorridors(
+    computeRoutingCorridors(routes),
+  );
+  let crossingCount = 0;
+  let bendCount = 0;
+  let totalLength = 0;
+  for (const route of Object.values(routes)) {
+    crossingCount += route.crossingGaps.length;
+    bendCount += Math.max(0, route.points.length - 2);
+    totalLength += routeLength(route.points);
+  }
+
+  const structural =
+    nodeOverlapCount * COST_NODE_OVERLAP +
+    edgeThroughNodeCount * COST_EDGE_THROUGH_NODE +
+    crossingCount * COST_CROSSING +
+    ambiguousCorridorCount * COST_AMBIGUOUS_CORRIDOR;
+  const total = structural + bendCount * COST_BEND + totalLength * COST_LENGTH;
+
+  return {
+    nodeOverlapCount,
+    edgeThroughNodeCount,
+    crossingCount,
+    ambiguousCorridorCount,
+    bendCount,
+    totalLength,
+    structural,
+    total,
+  };
+}
+
+function countRectOverlaps(rects: MapRect[]) {
+  let count = 0;
+  for (let first = 0; first < rects.length; first += 1) {
+    for (let second = first + 1; second < rects.length; second += 1) {
+      if (rectsOverlap(rects[first], rects[second])) count += 1;
+    }
+  }
+  return count;
+}
+
+function rectsOverlap(left: MapRect, right: MapRect) {
+  return (
+    left.x + GEOMETRY_EPSILON < right.x + right.width &&
+    right.x + GEOMETRY_EPSILON < left.x + left.width &&
+    left.y + GEOMETRY_EPSILON < right.y + right.height &&
+    right.y + GEOMETRY_EPSILON < left.y + left.height
+  );
+}
+
+function countEdgesThroughForeignNodes(
+  routes: Record<string, MapRoute>,
+  documentRects: Record<string, MapRect>,
+) {
+  let count = 0;
+  for (const route of Object.values(routes)) {
+    const ownIds = new Set([
+      route.sourcePort.documentId,
+      route.targetPort.documentId,
+    ]);
+    for (const [documentId, rect] of Object.entries(documentRects)) {
+      if (ownIds.has(documentId)) continue;
+      if (routeIntersectsRectInterior(route.points, rect)) count += 1;
+    }
+  }
+  return count;
+}
+
+function routeIntersectsRectInterior(points: MapPoint[], rect: MapRect) {
+  for (let index = 1; index < points.length; index += 1) {
+    if (segmentIntersectsRectInterior(points[index - 1], points[index], rect)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function countAmbiguousCorridors(corridors: MapCorridor[]) {
+  let count = 0;
+  for (let first = 0; first < corridors.length; first += 1) {
+    for (let second = first + 1; second < corridors.length; second += 1) {
+      if (corridorsCompeteForSpace(corridors[first], corridors[second])) {
+        count += 1;
+      }
+    }
+  }
+  return count;
+}
+
+function corridorsCompeteForSpace(left: MapCorridor, right: MapCorridor) {
+  if (left.axis !== right.axis) return false;
+  const gap =
+    Math.max(left.band.start, right.band.start) -
+    Math.min(left.band.end, right.band.end);
+  if (gap < 0 || gap > AMBIGUOUS_CORRIDOR_GAP) return false;
+  const extentOverlap =
+    Math.min(left.extent.end, right.extent.end) -
+    Math.max(left.extent.start, right.extent.start);
+  return extentOverlap >= CORRIDOR_MIN_OVERLAP;
 }
 
 function routeDescriptor(
@@ -1092,7 +1220,7 @@ function descriptorForLink(
   };
 }
 
-function absoluteRectangles(nodes: RoutableMapNode[]) {
+export function absoluteRectangles(nodes: RoutableMapNode[]) {
   const byId = new Map(nodes.map((node) => [node.id, node]));
   const positions = new Map<string, MapPoint>();
 

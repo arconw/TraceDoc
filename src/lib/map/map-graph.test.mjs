@@ -29,6 +29,8 @@ const {
   segmentIntersectsRectInterior,
   computeRoutingCorridors,
   computeGatewayRegions,
+  computeRoutingCost,
+  absoluteRectangles: routingAbsoluteRectangles,
 } = await loadTypeScript('./routing.ts');
 const {
   beginMapLayout,
@@ -1865,6 +1867,18 @@ function countRouteCrossings(edges) {
   return crossings;
 }
 
+function measureLayoutCost(layout) {
+  const routes = {};
+  for (const edge of layout.edges) routes[edge.id] = edge.data;
+  const rectangles = routingAbsoluteRectangles(layout.nodes);
+  const documentRects = {};
+  for (const node of layout.nodes) {
+    if (node.data.kind === 'document')
+      documentRects[node.id] = rectangles[node.id];
+  }
+  return computeRoutingCost(routes, documentRects);
+}
+
 test(
   'routes every deterministic stress fixture identically twice with finite, orthogonal, interior-safe geometry',
   { timeout: 120_000 },
@@ -2281,7 +2295,7 @@ test(
 );
 
 test(
-  'measures layout stability across the incremental-change fixture pair as a baseline for the later layout-feedback phase',
+  'measures layout stability across the incremental-change fixture pair, confirming the layout/routing feedback pass adds no extra movement when quality is already good',
   { timeout: 60_000 },
   async (context) => {
     const baseGraph = projectToMapGraph(
@@ -2325,6 +2339,74 @@ test(
       `incremental change: ${unchanged}/${shared} shared node positions unchanged after adding one document and one link`,
     );
     assert.ok(shared > 0);
+
+    const baseCost = measureLayoutCost(baseLayout);
+    const nextCost = measureLayoutCost(nextLayout);
+    assert.equal(
+      baseCost.structural,
+      0,
+      'incremental-base must already have zero structural routing cost, so the bounded feedback pass never engages for it',
+    );
+    assert.equal(
+      nextCost.structural,
+      0,
+      'incremental-next must also have zero structural routing cost, so the feedback pass introduces no movement beyond whatever a single ELK pass already produces for this small edit',
+    );
+  },
+);
+
+test(
+  'reduces routing cost through the bounded layout/routing feedback pass on a deliberately poor initial layout',
+  { timeout: 60_000 },
+  async (context) => {
+    const fixture = routingFixtureBySlug('dense-skip-chain');
+    const graph = projectToMapGraph(buildFixtureProject(fixture));
+
+    const singlePass = await layoutMapGraph(graph, new ELK(), {
+      maxIterations: 1,
+    });
+    const feedbackPass = await layoutMapGraph(graph, new ELK());
+    const feedbackPassAgain = await layoutMapGraph(graph, new ELK());
+
+    const singleCost = measureLayoutCost(singlePass);
+    const feedbackCost = measureLayoutCost(feedbackPass);
+
+    context.diagnostic(
+      `dense-skip-chain: single-pass cost ${singleCost.total.toFixed(1)} (structural ${singleCost.structural}, crossings ${singleCost.crossingCount}) vs feedback-pass cost ${feedbackCost.total.toFixed(1)} (structural ${feedbackCost.structural}, crossings ${feedbackCost.crossingCount})`,
+    );
+
+    assert.ok(
+      feedbackCost.total <= singleCost.total,
+      'the bounded feedback pass must never produce a worse routing-quality cost than a single, unadjusted ELK pass',
+    );
+    assert.ok(
+      feedbackCost.structural < singleCost.structural,
+      'the bounded feedback pass must measurably reduce structural routing defects (crossings, overlaps, ambiguous corridors) on a deliberately poor initial layout',
+    );
+
+    assert.deepEqual(
+      feedbackPass.nodes.map((node) => [
+        node.id,
+        node.position.x,
+        node.position.y,
+      ]),
+      feedbackPassAgain.nodes.map((node) => [
+        node.id,
+        node.position.x,
+        node.position.y,
+      ]),
+      'the feedback pass must produce identical node placement across repeated runs of the same graph',
+    );
+    assert.deepEqual(
+      feedbackPass.edges.map((edge) => edge.data.points),
+      feedbackPassAgain.edges.map((edge) => edge.data.points),
+      'the feedback pass must route identically across repeated runs of the same graph',
+    );
+
+    feedbackPass.edges.forEach(assertRouteGeometry);
+    assertAvoidsDocumentInteriors(feedbackPass);
+    assertValidArrowAndPorts(feedbackPass, fixture.slug);
+    assertExplicitPortModel(feedbackPass, fixture.slug);
   },
 );
 

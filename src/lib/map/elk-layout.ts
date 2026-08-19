@@ -2,12 +2,17 @@ import type { Edge, Node } from '@xyflow/svelte';
 import type { ELK, ElkExtendedEdge, ElkNode } from 'elkjs/lib/elk-api';
 import type { MapGraph } from './project-graph';
 import {
+  absoluteRectangles,
+  computeRoutingCost,
   routeMapLinks,
   type MapBoundaryGateway,
   type MapChevron,
   type MapCorridorAssignment,
   type MapPoint,
   type MapPort,
+  type MapRect,
+  type MapRoute,
+  type MapRoutingCost,
   type MapSide,
 } from './routing';
 
@@ -16,6 +21,10 @@ const DOCUMENT_MIN_WIDTH = 176;
 const DOCUMENT_MAX_WIDTH = 272;
 const FOLDER_HEADER = 44;
 const FOLDER_PADDING = 20;
+const HIGH_DEGREE_THRESHOLD = 8;
+const LAYOUT_FEEDBACK_ITERATIONS = 3;
+const LAYOUT_SPACING_MULTIPLIERS = [1, 1.35, 1.75];
+const LAYOUT_FEEDBACK_TIME_BUDGET_MS = 4000;
 
 export interface MapNodeData extends Record<string, unknown> {
   kind: 'folder' | 'document';
@@ -63,17 +72,89 @@ export interface MapLayout {
   edges: MapFlowEdge[];
 }
 
+export interface MapLayoutOptions {
+  maxIterations?: number;
+}
+
 export async function layoutMapGraph(
   graph: MapGraph,
   engine: Pick<ELK, 'layout'>,
+  options: MapLayoutOptions = {},
+): Promise<MapLayout> {
+  const degrees = computeNodeDegrees(graph);
+  const startedAt = performance.now();
+  const maxIterations = Math.max(
+    1,
+    Math.min(
+      LAYOUT_FEEDBACK_ITERATIONS,
+      options.maxIterations ?? LAYOUT_FEEDBACK_ITERATIONS,
+    ),
+  );
+  let best: { layout: MapLayout; total: number } | null = null;
+  let previousTotal = Number.POSITIVE_INFINITY;
+
+  for (let iteration = 0; iteration < maxIterations; iteration += 1) {
+    const spacingMultiplier =
+      LAYOUT_SPACING_MULTIPLIERS[iteration] ??
+      LAYOUT_SPACING_MULTIPLIERS.at(-1)!;
+    const layout = await layoutPass(graph, engine, degrees, spacingMultiplier);
+    const cost = measureLayoutCost(layout);
+
+    if (!best || cost.total < best.total) best = { layout, total: cost.total };
+    const improved = cost.total < previousTotal;
+    previousTotal = cost.total;
+    const elapsed = performance.now() - startedAt;
+
+    if (cost.structural === 0) break;
+    if (!improved && iteration > 0) break;
+    if (elapsed >= LAYOUT_FEEDBACK_TIME_BUDGET_MS) break;
+  }
+
+  return best!.layout;
+}
+
+async function layoutPass(
+  graph: MapGraph,
+  engine: Pick<ELK, 'layout'>,
+  degrees: Map<string, number>,
+  spacingMultiplier: number,
 ): Promise<MapLayout> {
   const rootFolders = await Promise.all(
     graph.rootFolderIds.map((folderId) =>
-      layoutFolder(graph, folderId, engine),
+      layoutFolder(graph, folderId, engine, degrees, spacingMultiplier),
     ),
   );
-  const root = await layoutRootFolders(rootFolders, engine);
+  const root = await layoutRootFolders(rootFolders, engine, spacingMultiplier);
   return elkGraphToFlow(graph, root);
+}
+
+function measureLayoutCost(layout: MapLayout): MapRoutingCost {
+  const routes: Record<string, MapRoute> = {};
+  for (const edge of layout.edges) routes[edge.id] = edge.data as MapRoute;
+
+  const rectangles = absoluteRectangles(layout.nodes);
+  const documentRects: Record<string, MapRect> = {};
+  for (const node of layout.nodes) {
+    if (node.data.kind === 'document')
+      documentRects[node.id] = rectangles[node.id];
+  }
+
+  return computeRoutingCost(routes, documentRects);
+}
+
+function computeNodeDegrees(graph: MapGraph): Map<string, number> {
+  const degrees = new Map<string, number>();
+  for (const link of graph.links) {
+    degrees.set(
+      link.sourceDocumentId,
+      (degrees.get(link.sourceDocumentId) ?? 0) + 1,
+    );
+    degrees.set(
+      link.targetDocumentId,
+      (degrees.get(link.targetDocumentId) ?? 0) + 1,
+    );
+  }
+  return degrees;
 }
 
 export function elkGraphToFlow(graph: MapGraph, layout: ElkMapNode): MapLayout {
@@ -187,16 +268,18 @@ async function layoutFolder(
   graph: MapGraph,
   folderId: string,
   engine: Pick<ELK, 'layout'>,
+  degrees: Map<string, number>,
+  spacingMultiplier: number,
 ): Promise<ElkMapNode> {
   const folder = graph.folders[folderId];
   const childFolders = await Promise.all(
     folder.childFolderIds.map((childFolderId) =>
-      layoutFolder(graph, childFolderId, engine),
+      layoutFolder(graph, childFolderId, engine, degrees, spacingMultiplier),
     ),
   );
   const documents = folder.documentIds
     .filter((documentId) => Boolean(graph.documents[documentId]))
-    .map((documentId) => buildDocumentNode(graph, documentId));
+    .map((documentId) => buildDocumentNode(graph, documentId, degrees));
   const children = [...childFolders, ...documents];
 
   if (children.length === 0) {
@@ -211,12 +294,12 @@ async function layoutFolder(
 
   const layoutInput: ElkNode = {
     id: `layout:${folder.id}`,
-    layoutOptions: layoutOptions(),
-    children: children.map(({ id, width, height }) => ({
+    layoutOptions: layoutOptions(spacingMultiplier),
+    children: children.map(({ id, width, height, layoutOptions: hints }) => ({
       id,
       width,
       height,
-      layoutOptions: { 'elk.portConstraints': 'FIXED_SIDE' },
+      layoutOptions: { 'elk.portConstraints': 'FIXED_SIDE', ...hints },
       ports: fixedSidePorts(id),
     })),
     edges: layoutEdgesForFolder(graph, folder.id),
@@ -246,6 +329,7 @@ async function layoutFolder(
 async function layoutRootFolders(
   folders: ElkMapNode[],
   engine: Pick<ELK, 'layout'>,
+  spacingMultiplier: number,
 ): Promise<ElkMapNode> {
   if (folders.length <= 1) {
     return {
@@ -257,7 +341,7 @@ async function layoutRootFolders(
 
   const positioned = await engine.layout({
     id: 'tracedoc-map-root-layout',
-    layoutOptions: layoutOptions(),
+    layoutOptions: layoutOptions(spacingMultiplier),
     children: folders.map(({ id, width, height }) => ({ id, width, height })),
   });
   const positions = new Map(
@@ -326,9 +410,14 @@ function directChildForDocument(
   return null;
 }
 
-function buildDocumentNode(graph: MapGraph, documentId: string): ElkMapNode {
+function buildDocumentNode(
+  graph: MapGraph,
+  documentId: string,
+  degrees: Map<string, number>,
+): ElkMapNode {
   const document = graph.documents[documentId];
   const measuredWidth = 64 + Array.from(document.title).length * 7.2;
+  const degree = degrees.get(documentId) ?? 0;
 
   return {
     id: document.id,
@@ -338,10 +427,17 @@ function buildDocumentNode(graph: MapGraph, documentId: string): ElkMapNode {
       Math.max(DOCUMENT_MIN_WIDTH, measuredWidth),
     ),
     height: DOCUMENT_HEIGHT,
+    layoutOptions:
+      degree >= HIGH_DEGREE_THRESHOLD
+        ? { 'elk.priority': String(Math.min(degree, 999)) }
+        : undefined,
   };
 }
 
-function layoutOptions() {
+function layoutOptions(spacingMultiplier: number) {
+  const scaled = (value: number) =>
+    String(Math.round(value * spacingMultiplier));
+
   return {
     'elk.algorithm': 'layered',
     'elk.direction': 'RIGHT',
@@ -353,16 +449,16 @@ function layoutOptions() {
     'elk.layered.mergeEdges': 'false',
     'elk.layered.nodePlacement.favorStraightEdges': 'true',
     'elk.layered.nodePlacement.strategy': 'SIMPLE',
-    'elk.layered.spacing.edgeEdgeBetweenLayers': '10',
-    'elk.layered.spacing.edgeNodeBetweenLayers': '24',
-    'elk.layered.spacing.nodeNodeBetweenLayers': '88',
+    'elk.layered.spacing.edgeEdgeBetweenLayers': scaled(10),
+    'elk.layered.spacing.edgeNodeBetweenLayers': scaled(24),
+    'elk.layered.spacing.nodeNodeBetweenLayers': scaled(88),
     'elk.layered.unnecessaryBendpoints': 'true',
     'elk.randomSeed': '1',
     'elk.separateConnectedComponents': 'false',
-    'elk.spacing.componentComponent': '52',
-    'elk.spacing.edgeEdge': '10',
-    'elk.spacing.edgeNode': '24',
-    'elk.spacing.nodeNode': '44',
+    'elk.spacing.componentComponent': scaled(52),
+    'elk.spacing.edgeEdge': scaled(10),
+    'elk.spacing.edgeNode': scaled(24),
+    'elk.spacing.nodeNode': scaled(44),
   };
 }
 

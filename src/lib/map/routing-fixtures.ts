@@ -331,6 +331,33 @@ function unrelatedNearCorridorFixture(): RoutingFixture {
   };
 }
 
+function denseSkipChainFixture(): RoutingFixture {
+  const count = 18;
+  const skip = 4;
+  const documents: RoutingFixtureDocument[] = [];
+  for (let index = 1; index <= count; index += 1) {
+    const links: string[] = [];
+    if (index + 1 <= count)
+      links.push(`modules/module-${padded(index + 1)}.md`);
+    if (index + skip <= count)
+      links.push(`modules/module-${padded(index + skip)}.md`);
+    documents.push(
+      doc(
+        `modules/module-${padded(index)}.md`,
+        `Module ${padded(index)}`,
+        links,
+      ),
+    );
+  }
+  return {
+    slug: 'dense-skip-chain',
+    name: 'Dense chain with skip-ahead links',
+    invariant:
+      '18 densely packed documents in one folder form a sequential chain, each also linking 4 positions ahead. The tightly spaced initial layout forces several of those skip-ahead links into real geometric crossings; the bounded layout/routing feedback pass (phase 5) must reduce total routing cost relative to a single, unadjusted ELK pass without exceeding its bounded iteration/time budget.',
+    documents,
+  };
+}
+
 function incrementalModuleGraph(extra: boolean): RoutingFixtureDocument[] {
   const moduleCount = 12;
   const documents: RoutingFixtureDocument[] = [];
@@ -380,6 +407,7 @@ export const ROUTING_FIXTURES: RoutingFixture[] = [
   crossingHeavyFixture(),
   mixedHubFixture(),
   unrelatedNearCorridorFixture(),
+  denseSkipChainFixture(),
   incrementalBaseFixture(),
   incrementalNextFixture(),
 ];
