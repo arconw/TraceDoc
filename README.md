@@ -19,6 +19,12 @@ npm run tauri dev
 
 `npm run dev` starts only the Vite frontend. It is useful for layout work, but filesystem commands require the Tauri application.
 
+Deterministic architecture-map debug workspaces live under [`test-fixtures/map-routing`](test-fixtures/map-routing/README.md); open any of them like a regular workspace to exercise a specific routing scenario (fan-in/out, corridors, cross-folder highways, and more). Regenerate them from their fixture definitions with:
+
+```sh
+node scripts/generate-map-fixtures.mjs
+```
+
 Validation commands:
 
 ```sh

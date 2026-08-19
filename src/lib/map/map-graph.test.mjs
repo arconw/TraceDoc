@@ -50,6 +50,8 @@ const {
   resolveTracedEdge,
   retryQueuedMapLayout,
 } = await loadTypeScript('./map-view-state.ts');
+const { buildFixtureProject, ROUTING_FIXTURES, routingFixtureBySlug } =
+  await loadTypeScript('./routing-fixtures.ts');
 
 test('ignores body-only changes in the map layout signature', () => {
   const project = nestedProject();
@@ -667,15 +669,20 @@ function routableGraph(folders, documents, links) {
   return {
     rootFolderIds: [folders[0].id],
     folders: Object.fromEntries(folders.map((item) => [item.id, item])),
-    documents: Object.fromEntries(
-      documents.map((item) => [item.id, item]),
-    ),
+    documents: Object.fromEntries(documents.map((item) => [item.id, item])),
     links,
   };
 }
 
 function routableDocument(id, parentId, title) {
-  return { id, name: `${id}.md`, title, path: `${id}.md`, parentId, headings: [] };
+  return {
+    id,
+    name: `${id}.md`,
+    title,
+    path: `${id}.md`,
+    parentId,
+    headings: [],
+  };
 }
 
 function routableLink(id, sourceDocumentId, targetDocumentId) {
@@ -989,7 +996,8 @@ test('rolls back a doomed cross-folder link zone reservations instead of detouri
     ],
     Object.values(graph.documents).filter(
       (document) =>
-        document.id !== 'document:outside' && document.id !== 'document:blocker',
+        document.id !== 'document:outside' &&
+        document.id !== 'document:blocker',
     ),
     [
       routableLink(
@@ -1002,7 +1010,9 @@ test('rolls back a doomed cross-folder link zone reservations instead of detouri
   const baselineNodes = nodes.filter(
     (node) => node.id !== 'document:outside' && node.id !== 'document:blocker',
   );
-  const baselineRoute = routeMapLinks(baselineGraph, baselineNodes)['link:survivor'];
+  const baselineRoute = routeMapLinks(baselineGraph, baselineNodes)[
+    'link:survivor'
+  ];
 
   assert.ok(baselineRoute);
   assert.deepEqual(
@@ -1612,3 +1622,326 @@ test('does not clear a different document trace from a stale unmount of a previo
   const documentTraceActive = hoveredDocumentId !== null;
   assert.equal(documentTraceActive, true);
 });
+
+function assertRouteGeometry(edge) {
+  assertOrthogonal(edge);
+  for (const point of edge.data.points) {
+    assert.ok(
+      Number.isFinite(point.x) && Number.isFinite(point.y),
+      `${edge.id} has a non-finite coordinate`,
+    );
+  }
+  for (let index = 1; index < edge.data.points.length; index += 1) {
+    const previous = edge.data.points[index - 1];
+    const current = edge.data.points[index];
+    assert.ok(
+      previous.x !== current.x || previous.y !== current.y,
+      `${edge.id} contains a zero-length segment`,
+    );
+  }
+}
+
+function assertValidArrowAndPorts(layout, slug) {
+  assert.ok(
+    layout.edges.every(
+      (edge) =>
+        edge.markerEnd?.type === 'arrowclosed' &&
+        typeof edge.sourceHandle === 'string' &&
+        typeof edge.targetHandle === 'string',
+    ),
+    `${slug} is missing a valid arrow marker or side handle on some edge`,
+  );
+}
+
+function segmentsCross(sourceA, targetA, sourceB, targetB) {
+  const aHorizontal = sourceA.y === targetA.y;
+  const bHorizontal = sourceB.y === targetB.y;
+  if (aHorizontal === bHorizontal) return false;
+  const horizontal = aHorizontal
+    ? {
+        y: sourceA.y,
+        x1: Math.min(sourceA.x, targetA.x),
+        x2: Math.max(sourceA.x, targetA.x),
+      }
+    : {
+        y: sourceB.y,
+        x1: Math.min(sourceB.x, targetB.x),
+        x2: Math.max(sourceB.x, targetB.x),
+      };
+  const vertical = aHorizontal
+    ? {
+        x: sourceB.x,
+        y1: Math.min(sourceB.y, targetB.y),
+        y2: Math.max(sourceB.y, targetB.y),
+      }
+    : {
+        x: sourceA.x,
+        y1: Math.min(sourceA.y, targetA.y),
+        y2: Math.max(sourceA.y, targetA.y),
+      };
+  return (
+    vertical.x > horizontal.x1 &&
+    vertical.x < horizontal.x2 &&
+    horizontal.y > vertical.y1 &&
+    horizontal.y < vertical.y2
+  );
+}
+
+function countRouteCrossings(edges) {
+  const segments = [];
+  for (const edge of edges) {
+    for (let index = 1; index < edge.data.points.length; index += 1) {
+      segments.push({
+        edgeId: edge.id,
+        source: edge.data.points[index - 1],
+        target: edge.data.points[index],
+      });
+    }
+  }
+  let crossings = 0;
+  for (let first = 0; first < segments.length; first += 1) {
+    for (let second = first + 1; second < segments.length; second += 1) {
+      if (segments[first].edgeId === segments[second].edgeId) continue;
+      if (
+        segmentsCross(
+          segments[first].source,
+          segments[first].target,
+          segments[second].source,
+          segments[second].target,
+        )
+      ) {
+        crossings += 1;
+      }
+    }
+  }
+  return crossings;
+}
+
+test(
+  'routes every deterministic stress fixture identically twice with finite, orthogonal, interior-safe geometry',
+  { timeout: 120_000 },
+  async (context) => {
+    const started = performance.now();
+    for (const fixture of ROUTING_FIXTURES) {
+      const graph = projectToMapGraph(buildFixtureProject(fixture));
+      const first = await layoutMapGraph(graph, new ELK());
+      const second = await layoutMapGraph(graph, new ELK());
+
+      assert.ok(first.edges.length > 0, `${fixture.slug} produced no edges`);
+      first.edges.forEach(assertRouteGeometry);
+      assertAvoidsDocumentInteriors(first);
+      assertValidArrowAndPorts(first, fixture.slug);
+      assert.deepEqual(
+        first.edges.map((edge) => edge.data.points),
+        second.edges.map((edge) => edge.data.points),
+        `${fixture.slug} routed non-deterministically`,
+      );
+      assert.deepEqual(
+        first.nodes.map((node) => [node.id, node.position.x, node.position.y]),
+        second.nodes.map((node) => [node.id, node.position.x, node.position.y]),
+        `${fixture.slug} laid out non-deterministically`,
+      );
+    }
+    context.diagnostic(
+      `${ROUTING_FIXTURES.length} stress fixtures laid out twice in ${(performance.now() - started).toFixed(1)} ms`,
+    );
+    assert.ok(
+      performance.now() - started < 60_000,
+      'stress fixtures exceeded the bounded layout time budget',
+    );
+  },
+);
+
+test(
+  'routes the cross-folder highway and nested fixtures through ordered, hierarchy-correct boundary gateways',
+  { timeout: 60_000 },
+  async () => {
+    for (const slug of [
+      'cross-folder-highway',
+      'nested-to-external',
+      'unrelated-near-corridor',
+    ]) {
+      const fixture = routingFixtureBySlug(slug);
+      const graph = projectToMapGraph(buildFixtureProject(fixture));
+      const layout = await layoutMapGraph(graph, new ELK());
+      assertFolderGatewayPolicy(graph, layout);
+    }
+  },
+);
+
+test(
+  'keeps both directions of the bidirectional corridor as independent, non-merged edges',
+  { timeout: 60_000 },
+  async () => {
+    const fixture = routingFixtureBySlug('bidirectional-corridor');
+    const graph = projectToMapGraph(buildFixtureProject(fixture));
+    const layout = await layoutMapGraph(graph, new ELK());
+
+    assert.equal(layout.edges.length, 20);
+    assert.equal(new Set(layout.edges.map((edge) => edge.id)).size, 20);
+
+    const perPair = new Map();
+    for (const edge of layout.edges) {
+      const key = [edge.source, edge.target].sort().join('|');
+      perPair.set(key, (perPair.get(key) ?? 0) + 1);
+    }
+    assert.ok(
+      [...perPair.values()].every((count) => count === 2),
+      'each left/right pair must keep exactly two independent edges, one per direction',
+    );
+
+    const pointSets = layout.edges.map((edge) =>
+      JSON.stringify(edge.data.points),
+    );
+    assert.equal(
+      new Set(pointSets).size,
+      20,
+      'opposite-direction edges between the same pair must not collapse onto identical geometry',
+    );
+  },
+);
+
+test(
+  'keeps inbound and outbound lanes on the mixed hub independently ordered within each direction',
+  { timeout: 60_000 },
+  async (context) => {
+    const fixture = routingFixtureBySlug('mixed-hub');
+    const graph = projectToMapGraph(buildFixtureProject(fixture));
+    const layout = await layoutMapGraph(graph, new ELK());
+
+    assert.equal(layout.edges.length, 16);
+    const outgoing = layout.edges.filter(
+      (edge) => edge.source === 'document:hub.md',
+    );
+    const incoming = layout.edges.filter(
+      (edge) => edge.target === 'document:hub.md',
+    );
+    assert.equal(outgoing.length, 8);
+    assert.equal(incoming.length, 8);
+    assert.equal(
+      new Set(outgoing.map((edge) => JSON.stringify(edge.data.points[0]))).size,
+      8,
+      'every outgoing edge must land on a distinct point along the hub boundary',
+    );
+    assert.equal(
+      new Set(incoming.map((edge) => JSON.stringify(edge.data.points.at(-1))))
+        .size,
+      8,
+      'every incoming edge must land on a distinct point along the hub boundary',
+    );
+
+    // The current router ranks a side's incoming and outgoing ports in
+    // separate groups (see routing.ts portKey), so a lane at the extreme
+    // edge of the hub's boundary can land an incoming and an outgoing edge
+    // on the exact same physical point when both happen to pick the same
+    // side. Coordinating ports across direction is exactly the future
+    // ports-phase invariant skipped above; this is its current-router
+    // baseline, not a hard pass/fail assertion yet.
+    const allHubEndpoints = [
+      ...outgoing.map((edge) => JSON.stringify(edge.data.points[0])),
+      ...incoming.map((edge) => JSON.stringify(edge.data.points.at(-1))),
+    ];
+    const distinctAcrossDirections = new Set(allHubEndpoints).size;
+    context.diagnostic(
+      `mixed-hub: ${distinctAcrossDirections}/16 hub endpoints are distinct across both directions combined (ports phase will make this 16/16)`,
+    );
+  },
+);
+
+test(
+  'measures real geometric crossings on the crossing-heavy fixture as a baseline for the later crossing-marker phase',
+  { timeout: 60_000 },
+  async (context) => {
+    const fixture = routingFixtureBySlug('crossing-heavy');
+    const graph = projectToMapGraph(buildFixtureProject(fixture));
+    const layout = await layoutMapGraph(graph, new ELK());
+
+    layout.edges.forEach(assertRouteGeometry);
+    assertAvoidsDocumentInteriors(layout);
+    const crossings = countRouteCrossings(layout.edges);
+    context.diagnostic(
+      `crossing-heavy fixture: ${crossings} real geometric segment crossings across ${layout.edges.length} edges`,
+    );
+    assert.ok(crossings >= 0);
+  },
+);
+
+test(
+  'measures layout stability across the incremental-change fixture pair as a baseline for the later layout-feedback phase',
+  { timeout: 60_000 },
+  async (context) => {
+    const baseGraph = projectToMapGraph(
+      buildFixtureProject(routingFixtureBySlug('incremental-base')),
+    );
+    const nextGraph = projectToMapGraph(
+      buildFixtureProject(routingFixtureBySlug('incremental-next')),
+    );
+
+    const baseLayout = await layoutMapGraph(baseGraph, new ELK());
+    const baseLayoutAgain = await layoutMapGraph(baseGraph, new ELK());
+    assert.deepEqual(
+      baseLayout.nodes.map((node) => [
+        node.id,
+        node.position.x,
+        node.position.y,
+      ]),
+      baseLayoutAgain.nodes.map((node) => [
+        node.id,
+        node.position.x,
+        node.position.y,
+      ]),
+      'the base fixture must lay out identically across repeated runs',
+    );
+
+    const nextLayout = await layoutMapGraph(nextGraph, new ELK());
+    const basePositions = new Map(
+      baseLayout.nodes.map((node) => [node.id, node.position]),
+    );
+    let shared = 0;
+    let unchanged = 0;
+    for (const node of nextLayout.nodes) {
+      const previous = basePositions.get(node.id);
+      if (!previous) continue;
+      shared += 1;
+      if (previous.x === node.position.x && previous.y === node.position.y) {
+        unchanged += 1;
+      }
+    }
+    context.diagnostic(
+      `incremental change: ${unchanged}/${shared} shared node positions unchanged after adding one document and one link`,
+    );
+    assert.ok(shared > 0);
+  },
+);
+
+test(
+  'assigns an explicit, structured port model to every route endpoint',
+  {
+    skip: 'Explicit MapPort objects land with the ports phase; the current router only distributes lane offsets along a side (routing.ts distributedOffset/portPoint).',
+  },
+  () => {},
+);
+
+test(
+  'renders directional chevrons along each route',
+  {
+    skip: 'Chevron rendering has not landed yet; it is introduced in the chevrons phase.',
+  },
+  () => {},
+);
+
+test(
+  'marks a crossing indicator only where two routes truly cross geometrically',
+  {
+    skip: 'Crossing markers have not landed yet. The crossing-heavy fixture test above already records a real-crossing-count baseline via context.diagnostic for that phase to compare against.',
+  },
+  () => {},
+);
+
+test(
+  'produces typed corridor/lane objects for multi-edge boundary crossings',
+  {
+    skip: 'Corridor/lane objects beyond MapBoundaryGateway land with the corridors/gateways phase; assertFolderGatewayPolicy above already covers boundary ordering on the current router.',
+  },
+  () => {},
+);
