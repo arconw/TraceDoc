@@ -8,7 +8,7 @@ Builds deterministic recursive compound placement with ELK, then invokes [`routi
 
 - `MapNodeData` — folder/document label/path, degree, this document's `ports` (`MapPort[]`, from [`routing`](routing.ts.md)), emphasis, the currently traced edge ID (`activeEdgeId`), open/trace/trace-unmount callbacks.
 - `MapFlowNode` — non-draggable folder/document node.
-- `MapEdgeData` — orthogonal points, endpoint sides, this edge's own `sourcePort`/`targetPort`, gateways, its `chevrons` (repeated direction markers, from [`routing`](routing.ts.md)) and `crossingGaps` (points where this edge's own path must render a small visual gap because an unrelated edge crosses it), accessibility label, emphasis/trace callback.
+- `MapEdgeData` — orthogonal points, endpoint sides, this edge's own `sourcePort`/`targetPort`, gateways (each carrying its resolved gateway-region/lane, from [`routing`](routing.ts.md)), its `chevrons` (repeated direction markers, from [`routing`](routing.ts.md)), `crossingGaps` (points where this edge's own path must render a small visual gap because an unrelated edge crosses it), `corridor` (this edge's shared-highway lane assignment, or `null` when it is not part of any detected corridor), accessibility label, emphasis/trace callback.
 - `MapFlowEdge` — nonselectable custom route edge.
 - `ElkMapNode` — internal recursive layout node.
 - `MapLayout` — final node/edge arrays.

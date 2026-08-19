@@ -24,8 +24,12 @@ async function loadTypeScript(relativePath) {
 const { mapLayoutSignature, projectToMapGraph } =
   await loadTypeScript('./project-graph.ts');
 const { layoutMapGraph } = await loadTypeScript('./elk-layout.ts');
-const { routeMapLinks, segmentIntersectsRectInterior } =
-  await loadTypeScript('./routing.ts');
+const {
+  routeMapLinks,
+  segmentIntersectsRectInterior,
+  computeRoutingCorridors,
+  computeGatewayRegions,
+} = await loadTypeScript('./routing.ts');
 const {
   beginMapLayout,
   beginQueuedMapLayout,
@@ -1955,6 +1959,182 @@ test(
 );
 
 test(
+  'groups dense same-direction and bidirectional traffic into deterministic shared corridors, without absorbing unrelated edges',
+  { timeout: 60_000 },
+  async () => {
+    const denseGraph = projectToMapGraph(
+      buildFixtureProject(routingFixtureBySlug('dense-corridor')),
+    );
+    const denseLayout = await layoutMapGraph(denseGraph, new ELK());
+    const denseRoutes = Object.fromEntries(
+      denseLayout.edges.map((edge) => [edge.id, edge.data]),
+    );
+    const denseCorridors = computeRoutingCorridors(denseRoutes);
+    const denseHighway = denseCorridors.find(
+      (corridor) => corridor.lanes.length === 20,
+    );
+    assert.ok(
+      denseHighway,
+      'the 20 west-to-east links must share one dense corridor',
+    );
+    assert.deepEqual(
+      new Set(denseHighway.lanes.map((lane) => lane.direction)).size,
+      1,
+      'a single-direction corridor must not mix directions',
+    );
+    assert.deepEqual(
+      new Set(denseHighway.lanes.map((lane) => lane.laneIndex)),
+      new Set(Array.from({ length: 20 }, (_, index) => index)),
+      'every member must own a distinct lane index',
+    );
+    assert.equal(
+      new Set(denseHighway.lanes.map((lane) => lane.linkId)).size,
+      20,
+      'every edge keeps its own identity inside the corridor',
+    );
+    assert.deepEqual(
+      computeRoutingCorridors(denseRoutes),
+      computeRoutingCorridors(denseRoutes),
+      'corridor detection must be deterministic across repeated calls',
+    );
+
+    const bidirectionalGraph = projectToMapGraph(
+      buildFixtureProject(routingFixtureBySlug('bidirectional-corridor')),
+    );
+    const bidirectionalLayout = await layoutMapGraph(
+      bidirectionalGraph,
+      new ELK(),
+    );
+    const bidirectionalRoutes = Object.fromEntries(
+      bidirectionalLayout.edges.map((edge) => [edge.id, edge.data]),
+    );
+    const bidirectionalCorridors = computeRoutingCorridors(bidirectionalRoutes);
+    const bidirectionalHighway = bidirectionalCorridors.find(
+      (corridor) => corridor.lanes.length === 20,
+    );
+    assert.ok(
+      bidirectionalHighway,
+      'the 10 left<->right pairs must share one bidirectional corridor',
+    );
+    const bidirectionalDirections = new Set(
+      bidirectionalHighway.lanes.map((lane) => lane.direction),
+    );
+    assert.equal(
+      bidirectionalDirections.size,
+      2,
+      'opposite travel directions must remain distinguishable inside the shared corridor',
+    );
+    assert.equal(
+      new Set(bidirectionalHighway.lanes.map((lane) => lane.linkId)).size,
+      20,
+      'each direction keeps 20 independent lane members, never merged',
+    );
+
+    const crossFolderGraph = projectToMapGraph(
+      buildFixtureProject(routingFixtureBySlug('cross-folder-highway')),
+    );
+    const crossFolderLayout = await layoutMapGraph(crossFolderGraph, new ELK());
+    const crossFolderRoutes = Object.fromEntries(
+      crossFolderLayout.edges.map((edge) => [edge.id, edge.data]),
+    );
+    const crossFolderHighway = computeRoutingCorridors(crossFolderRoutes).find(
+      (corridor) => corridor.lanes.length === 16,
+    );
+    assert.ok(
+      crossFolderHighway,
+      'the 16 frontend-to-backend links must share one cross-folder highway',
+    );
+
+    const noiseGraph = projectToMapGraph(
+      buildFixtureProject(routingFixtureBySlug('unrelated-near-corridor')),
+    );
+    const noiseLayout = await layoutMapGraph(noiseGraph, new ELK());
+    const noiseRoutes = Object.fromEntries(
+      noiseLayout.edges.map((edge) => [edge.id, edge.data]),
+    );
+    const noiseCorridors = computeRoutingCorridors(noiseRoutes);
+    assert.equal(
+      noiseCorridors.length,
+      1,
+      'only the real 5-link corridor may register; the nearby chain must not form a false-positive highway',
+    );
+    assert.equal(noiseCorridors[0].lanes.length, 5);
+    const nearbyLinkIds = new Set(
+      Object.keys(noiseRoutes).filter((linkId) =>
+        noiseRoutes[linkId].sourcePort.documentId.includes('nearby/'),
+      ),
+    );
+    assert.ok(
+      noiseCorridors[0].lanes.every((lane) => !nearbyLinkIds.has(lane.linkId)),
+      'the unrelated nearby chain must never be absorbed into the corridor',
+    );
+  },
+);
+
+test(
+  'produces typed gateway region/lane objects for multi-edge and single-edge folder boundary crossings',
+  { timeout: 60_000 },
+  async () => {
+    const crossFolderGraph = projectToMapGraph(
+      buildFixtureProject(routingFixtureBySlug('cross-folder-highway')),
+    );
+    const crossFolderLayout = await layoutMapGraph(crossFolderGraph, new ELK());
+    const crossFolderRoutes = Object.fromEntries(
+      crossFolderLayout.edges.map((edge) => [edge.id, edge.data]),
+    );
+    const crossFolderRegions = computeGatewayRegions(crossFolderRoutes);
+
+    assert.equal(
+      crossFolderRegions.length,
+      2,
+      'the frontend and backend boundaries each converge through one deterministic gateway region',
+    );
+    for (const region of crossFolderRegions) {
+      assert.equal(region.lanes.length, 16);
+      assert.deepEqual(
+        region.lanes.map((lane) => lane.laneIndex),
+        Array.from({ length: 16 }, (_, index) => index),
+      );
+      assert.equal(
+        new Set(region.lanes.map((lane) => lane.linkId)).size,
+        16,
+        'every crossing link keeps a distinct lane inside its gateway region',
+      );
+    }
+    assert.deepEqual(
+      computeGatewayRegions(crossFolderRoutes),
+      computeGatewayRegions(crossFolderRoutes),
+      'gateway region assignment must be deterministic across repeated calls',
+    );
+
+    const nestedGraph = projectToMapGraph(
+      buildFixtureProject(routingFixtureBySlug('nested-to-external')),
+    );
+    const nestedLayout = await layoutMapGraph(nestedGraph, new ELK());
+    const nestedRoutes = Object.fromEntries(
+      nestedLayout.edges.map((edge) => [edge.id, edge.data]),
+    );
+    const nestedRegions = computeGatewayRegions(nestedRoutes);
+    const onlyRoute = Object.values(nestedRoutes)[0];
+
+    assert.equal(
+      nestedRegions.length,
+      onlyRoute.boundaryGateways.length,
+      'every boundary crossed by the nested link gets its own single-member gateway region',
+    );
+    assert.ok(
+      nestedRegions.every((region) => region.lanes.length === 1),
+      'a single edge crossing a boundary alone still gets a well-formed, single-lane gateway region',
+    );
+    assert.deepEqual(
+      [...nestedRegions.map((region) => region.folderId)].sort(),
+      [...onlyRoute.boundaryGateways.map((gateway) => gateway.folderId)].sort(),
+      'gateway regions must cover exactly the same boundary crossings the route itself traverses',
+    );
+  },
+);
+
+test(
   'keeps inbound and outbound lanes on the mixed hub independently ordered, and collision-free combined across both directions',
   { timeout: 60_000 },
   async () => {
@@ -2304,11 +2484,7 @@ function chevronRouteFixture() {
     routableLink('link:short', 'document:short-a', 'document:short-b'),
     routableLink('link:medium', 'document:medium-a', 'document:medium-b'),
     routableLink('link:long', 'document:long-a', 'document:long-b'),
-    routableLink(
-      'link:vertical',
-      'document:vertical-a',
-      'document:vertical-b',
-    ),
+    routableLink('link:vertical', 'document:vertical-a', 'document:vertical-b'),
     routableLink('link:bend', 'document:bend-a', 'document:bend-b'),
   ]);
   const nodes = [
@@ -2376,7 +2552,10 @@ test('renders directional chevrons along each route, scaled by length and restra
   const vertical = routes['link:vertical'];
   const bend = routes['link:bend'];
 
-  assert.ok(short && medium && long && vertical && bend, 'fixture links must all route');
+  assert.ok(
+    short && medium && long && vertical && bend,
+    'fixture links must all route',
+  );
 
   assert.equal(
     short.chevrons.length,
@@ -2563,10 +2742,7 @@ test(
     const columnA = gridRoutes['link:column-a'];
     const columnB = gridRoutes['link:column-b'];
 
-    assert.ok(
-      rowA && rowB && columnA && columnB,
-      'every grid link must route',
-    );
+    assert.ok(rowA && rowB && columnA && columnB, 'every grid link must route');
     assert.equal(
       rowA.crossingGaps.length,
       2,
@@ -2602,18 +2778,130 @@ test(
   },
 );
 
-test(
-  'marks a crossing indicator for a crossing occurring inside a shared highway lane area',
-  {
-    skip: 'Shared/highway corridor lanes do not exist until phase 4 of the routing epic, so there is no highway geometry for a crossing to occur inside yet.',
-  },
-  () => {},
-);
+function highwayCrossingFixture() {
+  const rowCount = 4;
+  const folder = {
+    id: 'folder:highway-crossing',
+    name: 'highway-crossing',
+    path: 'highway-crossing',
+    parentId: null,
+    childFolderIds: [],
+    documentIds: [
+      ...Array.from(
+        { length: rowCount },
+        (_, index) => `document:row-${index}-left`,
+      ),
+      ...Array.from(
+        { length: rowCount },
+        (_, index) => `document:row-${index}-right`,
+      ),
+      'document:crosser-top',
+      'document:crosser-bottom',
+    ],
+  };
+  const documents = folder.documentIds.map((id) =>
+    routableDocument(id, folder.id, id),
+  );
+  const rowLinks = Array.from({ length: rowCount }, (_, index) =>
+    routableLink(
+      `link:row-${index}`,
+      `document:row-${index}-left`,
+      `document:row-${index}-right`,
+    ),
+  );
+  const graph = routableGraph([folder], documents, [
+    ...rowLinks,
+    routableLink(
+      'link:crosser',
+      'document:crosser-top',
+      'document:crosser-bottom',
+    ),
+  ]);
+  const nodes = [
+    {
+      id: folder.id,
+      position: { x: 0, y: 0 },
+      width: 750,
+      height: 300,
+      data: { kind: 'folder' },
+    },
+    ...Array.from({ length: rowCount }, (_, index) =>
+      rectNode(
+        `document:row-${index}-left`,
+        folder.id,
+        20,
+        100 + index * 20,
+        60,
+        16,
+      ),
+    ),
+    ...Array.from({ length: rowCount }, (_, index) =>
+      rectNode(
+        `document:row-${index}-right`,
+        folder.id,
+        620,
+        100 + index * 20,
+        60,
+        16,
+      ),
+    ),
+    rectNode('document:crosser-top', folder.id, 300, 10, 20, 20),
+    rectNode('document:crosser-bottom', folder.id, 300, 250, 20, 20),
+  ];
+  return { graph, nodes, rowCount };
+}
 
 test(
-  'produces typed corridor/lane objects for multi-edge boundary crossings',
-  {
-    skip: 'Corridor/lane objects beyond MapBoundaryGateway land with the corridors/gateways phase; assertFolderGatewayPolicy above already covers boundary ordering on the current router.',
+  'marks a crossing indicator for a crossing occurring inside a shared highway lane area',
+  { timeout: 60_000 },
+  () => {
+    const { graph, nodes, rowCount } = highwayCrossingFixture();
+    const routes = routeMapLinks(graph, nodes);
+    const rowIds = Array.from(
+      { length: rowCount },
+      (_, index) => `link:row-${index}`,
+    );
+    const rowRoutes = rowIds.map((id) => routes[id]);
+    const crosser = routes['link:crosser'];
+
+    assert.ok(
+      rowRoutes.every(Boolean) && crosser,
+      'every highway lane and the crosser link must route',
+    );
+    assert.ok(
+      rowRoutes.every((route) => route.corridor),
+      'every parallel row edge must join the shared highway corridor',
+    );
+    assert.equal(
+      new Set(rowRoutes.map((route) => route.corridor.corridorId)).size,
+      1,
+      'all rows must share exactly one corridor',
+    );
+    assert.deepEqual(
+      [...rowRoutes.map((route) => route.corridor.laneIndex)].sort(
+        (left, right) => left - right,
+      ),
+      [0, 1, 2, 3],
+      'lane assignment inside the highway must be deterministic and distinct',
+    );
+    assert.equal(
+      crosser.corridor,
+      null,
+      'a lone perpendicular crosser must not itself join the parallel highway',
+    );
+
+    for (const route of rowRoutes) {
+      assert.equal(
+        route.crossingGaps.length,
+        1,
+        'each highway lane must still carry its own crossing gap where the perpendicular edge crosses it',
+      );
+    }
+    assert.equal(
+      crosser.crossingGaps.length,
+      0,
+      'the crossing edge stays visually continuous through the highway, matching the horizontal-owns-the-gap convention',
+    );
+    assertCrossingGapsAreInterior(Object.values(routes));
   },
-  () => {},
 );

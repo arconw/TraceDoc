@@ -5,6 +5,7 @@ import {
   routeMapLinks,
   type MapBoundaryGateway,
   type MapChevron,
+  type MapCorridorAssignment,
   type MapPoint,
   type MapPort,
   type MapSide,
@@ -44,6 +45,7 @@ export interface MapEdgeData extends Record<string, unknown> {
   boundaryGateways: MapBoundaryGateway[];
   chevrons: MapChevron[];
   crossingGaps: MapPoint[];
+  corridor: MapCorridorAssignment | null;
   ariaLabel: string;
   emphasis?: 'normal' | 'active' | 'muted';
   onTracePointerEdge?: (edgeId: string | null) => void;
