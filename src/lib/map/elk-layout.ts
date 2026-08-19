@@ -4,6 +4,7 @@ import type { MapGraph } from './project-graph';
 import {
   routeMapLinks,
   type MapBoundaryGateway,
+  type MapChevron,
   type MapPoint,
   type MapPort,
   type MapSide,
@@ -41,6 +42,8 @@ export interface MapEdgeData extends Record<string, unknown> {
   sourcePort: MapPort;
   targetPort: MapPort;
   boundaryGateways: MapBoundaryGateway[];
+  chevrons: MapChevron[];
+  crossingGaps: MapPoint[];
   ariaLabel: string;
   emphasis?: 'normal' | 'active' | 'muted';
   onTracePointerEdge?: (edgeId: string | null) => void;

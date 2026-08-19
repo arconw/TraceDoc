@@ -25,6 +25,13 @@ export interface MapPort {
   offset: number;
 }
 
+export type MapChevronDirection = 'up' | 'down' | 'left' | 'right';
+
+export interface MapChevron {
+  point: MapPoint;
+  direction: MapChevronDirection;
+}
+
 export interface MapRoute {
   points: MapPoint[];
   sourceSide: MapSide;
@@ -32,6 +39,8 @@ export interface MapRoute {
   sourcePort: MapPort;
   targetPort: MapPort;
   boundaryGateways: MapBoundaryGateway[];
+  chevrons: MapChevron[];
+  crossingGaps: MapPoint[];
 }
 
 export interface RoutableMapNode {
@@ -77,6 +86,10 @@ const FOLDER_INSET = 4;
 const BEND_COST = 20;
 const SHARED_SEGMENT_COST = 12;
 const GEOMETRY_EPSILON = 1e-6;
+const CHEVRON_MIN_ROUTE_LENGTH = 96;
+const CHEVRON_END_MARGIN = 24;
+const CHEVRON_SPACING = 64;
+const CHEVRON_MAX_COUNT = 5;
 
 export class RouteUnavailableError extends Error {
   constructor(
@@ -118,6 +131,8 @@ export function routeMapLinks(
       reportUnroutableLink(descriptor, error);
     }
   }
+
+  attachCrossingGaps(routes);
 
   return routes;
 }
@@ -249,13 +264,17 @@ function routeDescriptor(
     throw error;
   }
 
+  const finalPoints = deduplicatePoints(points);
+
   return {
-    points: deduplicatePoints(points),
+    points: finalPoints,
     sourceSide: descriptor.sourceSide,
     targetSide: descriptor.targetSide,
     sourcePort,
     targetPort,
     boundaryGateways,
+    chevrons: computeRouteChevrons(finalPoints),
+    crossingGaps: [],
   };
 }
 
@@ -284,6 +303,188 @@ function reportUnroutableLink(descriptor: RouteDescriptor, error: unknown) {
   console.warn(
     `[map/routing] skipping unroutable link ${descriptor.link.id} (${descriptor.link.sourceDocumentId} -> ${descriptor.link.targetDocumentId}, lca ${descriptor.lcaId}): ${message}`,
   );
+}
+
+function manhattanDistance(source: MapPoint, target: MapPoint) {
+  return Math.abs(target.x - source.x) + Math.abs(target.y - source.y);
+}
+
+function routeLength(points: MapPoint[]) {
+  let total = 0;
+  for (let index = 1; index < points.length; index += 1) {
+    total += manhattanDistance(points[index - 1], points[index]);
+  }
+  return total;
+}
+
+function chevronDirection(
+  from: MapPoint,
+  to: MapPoint,
+): MapChevronDirection {
+  if (from.x === to.x) return to.y > from.y ? 'down' : 'up';
+  return to.x > from.x ? 'right' : 'left';
+}
+
+function pointAlongRoute(points: MapPoint[], distance: number): MapChevron {
+  let remaining = distance;
+  for (let index = 1; index < points.length; index += 1) {
+    const from = points[index - 1];
+    const to = points[index];
+    const length = manhattanDistance(from, to);
+    if (length <= 0) continue;
+    if (remaining <= length) {
+      const fraction = remaining / length;
+      return {
+        point: {
+          x: from.x + (to.x - from.x) * fraction,
+          y: from.y + (to.y - from.y) * fraction,
+        },
+        direction: chevronDirection(from, to),
+      };
+    }
+    remaining -= length;
+  }
+  const last = points.at(-1)!;
+  const beforeLast = points.at(-2) ?? last;
+  return { point: last, direction: chevronDirection(beforeLast, last) };
+}
+
+function computeRouteChevrons(points: MapPoint[]): MapChevron[] {
+  const total = routeLength(points);
+  if (total < CHEVRON_MIN_ROUTE_LENGTH) return [];
+  const usable = total - CHEVRON_END_MARGIN * 2;
+  if (usable <= 0) return [];
+  const count = Math.min(
+    CHEVRON_MAX_COUNT,
+    Math.max(1, Math.floor(usable / CHEVRON_SPACING)),
+  );
+  const chevrons: MapChevron[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const distance = CHEVRON_END_MARGIN + (usable * (index + 1)) / (count + 1);
+    chevrons.push(pointAlongRoute(points, distance));
+  }
+  return chevrons;
+}
+
+function attachCrossingGaps(routes: Record<string, MapRoute>) {
+  const gapsByLink = computeCrossingGaps(routes);
+  for (const [linkId, route] of Object.entries(routes)) {
+    route.crossingGaps = gapsByLink.get(linkId) ?? [];
+  }
+}
+
+function computeCrossingGaps(routes: Record<string, MapRoute>) {
+  const linkIds = Object.keys(routes);
+  const gaps = new Map<string, { point: MapPoint; distance: number }[]>();
+
+  for (let first = 0; first < linkIds.length; first += 1) {
+    for (let second = first + 1; second < linkIds.length; second += 1) {
+      recordRouteCrossings(routes, linkIds[first], linkIds[second], gaps);
+    }
+  }
+
+  const result = new Map<string, MapPoint[]>();
+  for (const [linkId, entries] of gaps) {
+    entries.sort((left, right) => left.distance - right.distance);
+    result.set(
+      linkId,
+      distinctPoints(entries.map((entry) => entry.point)),
+    );
+  }
+  return result;
+}
+
+function recordRouteCrossings(
+  routes: Record<string, MapRoute>,
+  firstLinkId: string,
+  secondLinkId: string,
+  gaps: Map<string, { point: MapPoint; distance: number }[]>,
+) {
+  const firstPoints = routes[firstLinkId].points;
+  const secondPoints = routes[secondLinkId].points;
+  let firstDistance = 0;
+
+  for (let firstIndex = 1; firstIndex < firstPoints.length; firstIndex += 1) {
+    const firstStart = firstPoints[firstIndex - 1];
+    const firstEnd = firstPoints[firstIndex];
+    let secondDistance = 0;
+
+    for (
+      let secondIndex = 1;
+      secondIndex < secondPoints.length;
+      secondIndex += 1
+    ) {
+      const secondStart = secondPoints[secondIndex - 1];
+      const secondEnd = secondPoints[secondIndex];
+      const crossing = segmentCrossingPoint(
+        firstStart,
+        firstEnd,
+        secondStart,
+        secondEnd,
+      );
+      if (crossing) {
+        const ownerLinkId = crossing.firstIsHorizontal
+          ? firstLinkId
+          : secondLinkId;
+        const distance = crossing.firstIsHorizontal
+          ? firstDistance + manhattanDistance(firstStart, crossing.point)
+          : secondDistance + manhattanDistance(secondStart, crossing.point);
+        const entries = gaps.get(ownerLinkId) ?? [];
+        entries.push({ point: crossing.point, distance });
+        gaps.set(ownerLinkId, entries);
+      }
+      secondDistance += manhattanDistance(secondStart, secondEnd);
+    }
+    firstDistance += manhattanDistance(firstStart, firstEnd);
+  }
+}
+
+function segmentCrossingPoint(
+  firstStart: MapPoint,
+  firstEnd: MapPoint,
+  secondStart: MapPoint,
+  secondEnd: MapPoint,
+) {
+  const firstIsHorizontal = firstStart.y === firstEnd.y;
+  const secondIsHorizontal = secondStart.y === secondEnd.y;
+  if (firstIsHorizontal === secondIsHorizontal) return null;
+
+  const horizontal = firstIsHorizontal
+    ? { y: firstStart.y, start: firstStart.x, end: firstEnd.x }
+    : { y: secondStart.y, start: secondStart.x, end: secondEnd.x };
+  const vertical = firstIsHorizontal
+    ? { x: secondStart.x, start: secondStart.y, end: secondEnd.y }
+    : { x: firstStart.x, start: firstStart.y, end: firstEnd.y };
+  const horizontalMin = Math.min(horizontal.start, horizontal.end);
+  const horizontalMax = Math.max(horizontal.start, horizontal.end);
+  const verticalMin = Math.min(vertical.start, vertical.end);
+  const verticalMax = Math.max(vertical.start, vertical.end);
+
+  if (
+    vertical.x <= horizontalMin + GEOMETRY_EPSILON ||
+    vertical.x >= horizontalMax - GEOMETRY_EPSILON ||
+    horizontal.y <= verticalMin + GEOMETRY_EPSILON ||
+    horizontal.y >= verticalMax - GEOMETRY_EPSILON
+  ) {
+    return null;
+  }
+
+  return {
+    point: { x: vertical.x, y: horizontal.y },
+    firstIsHorizontal,
+  };
+}
+
+function distinctPoints(points: MapPoint[]) {
+  const seen = new Set<string>();
+  const result: MapPoint[] = [];
+  for (const point of points) {
+    const key = `${point.x},${point.y}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(point);
+  }
+  return result;
 }
 
 export function segmentIntersectsRectInterior(

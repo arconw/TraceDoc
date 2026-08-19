@@ -2266,18 +2266,346 @@ test('assigns an explicit, structured port model to every route endpoint', () =>
   assertSpatialPortOrder(layout, 'document:hub', 'left', 'port-model');
 });
 
+function rectNode(id, parentId, x, y, width, height) {
+  return {
+    id,
+    parentId,
+    position: { x, y },
+    width,
+    height,
+    data: { kind: 'document' },
+  };
+}
+
+function chevronRouteFixture() {
+  const folder = {
+    id: 'folder:chevron-zone',
+    name: 'chevron-zone',
+    path: 'chevron-zone',
+    parentId: null,
+    childFolderIds: [],
+    documentIds: [
+      'document:short-a',
+      'document:short-b',
+      'document:medium-a',
+      'document:medium-b',
+      'document:long-a',
+      'document:long-b',
+      'document:vertical-a',
+      'document:vertical-b',
+      'document:bend-a',
+      'document:bend-b',
+    ],
+  };
+  const documents = folder.documentIds.map((id) =>
+    routableDocument(id, folder.id, id),
+  );
+  const graph = routableGraph([folder], documents, [
+    routableLink('link:short', 'document:short-a', 'document:short-b'),
+    routableLink('link:medium', 'document:medium-a', 'document:medium-b'),
+    routableLink('link:long', 'document:long-a', 'document:long-b'),
+    routableLink(
+      'link:vertical',
+      'document:vertical-a',
+      'document:vertical-b',
+    ),
+    routableLink('link:bend', 'document:bend-a', 'document:bend-b'),
+  ]);
+  const nodes = [
+    {
+      id: folder.id,
+      position: { x: 0, y: 0 },
+      width: 4200,
+      height: 900,
+      data: { kind: 'folder' },
+    },
+    // A short adjacent pair: the route is well under the chevron minimum
+    // length, so it must render none.
+    rectNode('document:short-a', folder.id, 0, 0, 60, 30),
+    rectNode('document:short-b', folder.id, 80, 0, 60, 30),
+    // A moderate horizontal gap: long enough for a few chevrons.
+    rectNode('document:medium-a', folder.id, 0, 200, 60, 30),
+    rectNode('document:medium-b', folder.id, 300, 200, 60, 30),
+    // A very long horizontal gap: chevron count must stay restrained
+    // rather than growing without bound.
+    rectNode('document:long-a', folder.id, 0, 400, 60, 30),
+    rectNode('document:long-b', folder.id, 3000, 400, 60, 30),
+    // A tall vertical pair, isolated in its own lane.
+    rectNode('document:vertical-a', folder.id, 3200, 0, 60, 30),
+    rectNode('document:vertical-b', folder.id, 3200, 700, 60, 30),
+    // Offset both horizontally and vertically so the router cannot take
+    // the direct single-segment fast path and must bend.
+    rectNode('document:bend-a', folder.id, 3400, 0, 60, 30),
+    rectNode('document:bend-b', folder.id, 3900, 300, 60, 30),
+  ];
+  return { graph, nodes };
+}
+
+function chevronMatchesSegment(points, chevron) {
+  for (let index = 1; index < points.length; index += 1) {
+    const from = points[index - 1];
+    const to = points[index];
+    const onSegment =
+      from.x === to.x
+        ? Math.abs(chevron.point.x - from.x) < 1e-6 &&
+          chevron.point.y >= Math.min(from.y, to.y) - 1e-6 &&
+          chevron.point.y <= Math.max(from.y, to.y) + 1e-6
+        : Math.abs(chevron.point.y - from.y) < 1e-6 &&
+          chevron.point.x >= Math.min(from.x, to.x) - 1e-6 &&
+          chevron.point.x <= Math.max(from.x, to.x) + 1e-6;
+    if (!onSegment) continue;
+    const expectedDirection =
+      from.x === to.x
+        ? to.y > from.y
+          ? 'down'
+          : 'up'
+        : to.x > from.x
+          ? 'right'
+          : 'left';
+    return chevron.direction === expectedDirection;
+  }
+  return false;
+}
+
+test('renders directional chevrons along each route, scaled by length and restrained on very long routes', () => {
+  const { graph, nodes } = chevronRouteFixture();
+  const routes = routeMapLinks(graph, nodes);
+  const short = routes['link:short'];
+  const medium = routes['link:medium'];
+  const long = routes['link:long'];
+  const vertical = routes['link:vertical'];
+  const bend = routes['link:bend'];
+
+  assert.ok(short && medium && long && vertical && bend, 'fixture links must all route');
+
+  assert.equal(
+    short.chevrons.length,
+    0,
+    'a route too short to need one must render no intermediate chevrons',
+  );
+  assert.ok(
+    medium.chevrons.length > 0,
+    'a sufficiently long route must render at least one chevron',
+  );
+  assert.ok(
+    long.chevrons.length >= medium.chevrons.length,
+    'a longer route must never render fewer chevrons than a shorter one',
+  );
+  assert.ok(
+    long.chevrons.length <= 8,
+    'chevron count must stay restrained rather than growing into a decorative chain on a very long route',
+  );
+
+  for (const route of [medium, long, vertical, bend]) {
+    for (const chevron of route.chevrons) {
+      assert.ok(
+        chevronMatchesSegment(route.points, chevron),
+        `chevron at ${JSON.stringify(chevron.point)} does not match the direction of its own route segment`,
+      );
+    }
+  }
+
+  assert.ok(
+    long.chevrons.every((chevron) => chevron.direction === 'right'),
+    'a purely horizontal route must render only right-facing chevrons',
+  );
+  assert.ok(
+    vertical.chevrons.length > 0 &&
+      vertical.chevrons.every((chevron) => chevron.direction === 'down'),
+    'a purely vertical route must render only down-facing chevrons',
+  );
+  assert.ok(
+    bend.points.length > 2,
+    'the bend fixture must actually produce a multi-segment route',
+  );
+  assert.ok(
+    bend.chevrons.length > 0,
+    'a long, bent route must still render chevrons across its bend',
+  );
+});
+
+function assertCrossingGapsAreInterior(routes) {
+  const endpoints = new Set();
+  for (const route of routes) {
+    for (const point of route.points) endpoints.add(`${point.x},${point.y}`);
+  }
+  for (const route of routes) {
+    for (const gap of route.crossingGaps) {
+      assert.equal(
+        endpoints.has(`${gap.x},${gap.y}`),
+        false,
+        'a crossing gap must never land exactly on a route endpoint, port, or corner - that would read as a genuine junction rather than a mere crossing',
+      );
+    }
+  }
+}
+
+function crossingFixture() {
+  const folder = {
+    id: 'folder:crossing-pair',
+    name: 'crossing-pair',
+    path: 'crossing-pair',
+    parentId: null,
+    childFolderIds: [],
+    documentIds: [
+      'document:left',
+      'document:right',
+      'document:top',
+      'document:bottom',
+    ],
+  };
+  const documents = folder.documentIds.map((id) =>
+    routableDocument(id, folder.id, id),
+  );
+  const graph = routableGraph([folder], documents, [
+    routableLink('link:horizontal', 'document:left', 'document:right'),
+    routableLink('link:vertical', 'document:top', 'document:bottom'),
+  ]);
+  const nodes = [
+    {
+      id: folder.id,
+      position: { x: 0, y: 0 },
+      width: 500,
+      height: 400,
+      data: { kind: 'folder' },
+    },
+    rectNode('document:left', folder.id, 20, 100, 60, 30),
+    rectNode('document:right', folder.id, 420, 100, 60, 30),
+    rectNode('document:top', folder.id, 220, 10, 60, 30),
+    rectNode('document:bottom', folder.id, 220, 340, 60, 30),
+  ];
+  return { graph, nodes };
+}
+
+function multiCrossingFixture() {
+  const folder = {
+    id: 'folder:crossing-grid',
+    name: 'crossing-grid',
+    path: 'crossing-grid',
+    parentId: null,
+    childFolderIds: [],
+    documentIds: [
+      'document:row-a-left',
+      'document:row-a-right',
+      'document:row-b-left',
+      'document:row-b-right',
+      'document:column-a-top',
+      'document:column-a-bottom',
+      'document:column-b-top',
+      'document:column-b-bottom',
+    ],
+  };
+  const documents = folder.documentIds.map((id) =>
+    routableDocument(id, folder.id, id),
+  );
+  const graph = routableGraph([folder], documents, [
+    routableLink('link:row-a', 'document:row-a-left', 'document:row-a-right'),
+    routableLink('link:row-b', 'document:row-b-left', 'document:row-b-right'),
+    routableLink(
+      'link:column-a',
+      'document:column-a-top',
+      'document:column-a-bottom',
+    ),
+    routableLink(
+      'link:column-b',
+      'document:column-b-top',
+      'document:column-b-bottom',
+    ),
+  ]);
+  const nodes = [
+    {
+      id: folder.id,
+      position: { x: 0, y: 0 },
+      width: 700,
+      height: 700,
+      data: { kind: 'folder' },
+    },
+    rectNode('document:row-a-left', folder.id, 20, 130, 60, 30),
+    rectNode('document:row-a-right', folder.id, 620, 130, 60, 30),
+    rectNode('document:row-b-left', folder.id, 20, 430, 60, 30),
+    rectNode('document:row-b-right', folder.id, 620, 430, 60, 30),
+    rectNode('document:column-a-top', folder.id, 230, 10, 60, 30),
+    rectNode('document:column-a-bottom', folder.id, 230, 640, 60, 30),
+    rectNode('document:column-b-top', folder.id, 480, 10, 60, 30),
+    rectNode('document:column-b-bottom', folder.id, 480, 640, 60, 30),
+  ];
+  return { graph, nodes };
+}
+
 test(
-  'renders directional chevrons along each route',
-  {
-    skip: 'Chevron rendering has not landed yet; it is introduced in the chevrons phase.',
+  'marks a crossing indicator only where two independent routes truly cross geometrically',
+  { timeout: 60_000 },
+  async () => {
+    const { graph: pairGraph, nodes: pairNodes } = crossingFixture();
+    const pairRoutes = routeMapLinks(pairGraph, pairNodes);
+    const horizontal = pairRoutes['link:horizontal'];
+    const vertical = pairRoutes['link:vertical'];
+
+    assert.ok(horizontal && vertical, 'both crossing links must route');
+    assertOrthogonalPoints(horizontal.points);
+    assertOrthogonalPoints(vertical.points);
+    assert.equal(
+      horizontal.crossingGaps.length,
+      1,
+      'the edge whose segment is horizontal at the crossing owns the gap',
+    );
+    assert.equal(
+      vertical.crossingGaps.length,
+      0,
+      'the crossing vertical edge must stay visually continuous through the intersection',
+    );
+    assertCrossingGapsAreInterior(Object.values(pairRoutes));
+
+    const { graph: gridGraph, nodes: gridNodes } = multiCrossingFixture();
+    const gridRoutes = routeMapLinks(gridGraph, gridNodes);
+    const rowA = gridRoutes['link:row-a'];
+    const rowB = gridRoutes['link:row-b'];
+    const columnA = gridRoutes['link:column-a'];
+    const columnB = gridRoutes['link:column-b'];
+
+    assert.ok(
+      rowA && rowB && columnA && columnB,
+      'every grid link must route',
+    );
+    assert.equal(
+      rowA.crossingGaps.length,
+      2,
+      'row A crosses both columns and owns both gaps',
+    );
+    assert.equal(
+      rowB.crossingGaps.length,
+      2,
+      'row B crosses both columns and owns both gaps',
+    );
+    assert.equal(
+      columnA.crossingGaps.length,
+      0,
+      'a vertical edge never owns a gap under the horizontal-owns-the-gap convention',
+    );
+    assert.equal(
+      columnB.crossingGaps.length,
+      0,
+      'a vertical edge never owns a gap under the horizontal-owns-the-gap convention',
+    );
+    assertCrossingGapsAreInterior(Object.values(gridRoutes));
+
+    // No accidental "junction" marker: across every deterministic stress
+    // fixture (TraceDoc's edges are independent - no fixture models a real
+    // shared connection point between two different links), no crossing
+    // gap may ever land on another route's endpoint/corner, which is the
+    // only way a mere crossing could be mistaken for a genuine junction.
+    for (const fixture of ROUTING_FIXTURES) {
+      const graph = projectToMapGraph(buildFixtureProject(fixture));
+      const layout = await layoutMapGraph(graph, new ELK());
+      assertCrossingGapsAreInterior(layout.edges.map((edge) => edge.data));
+    }
   },
-  () => {},
 );
 
 test(
-  'marks a crossing indicator only where two routes truly cross geometrically',
+  'marks a crossing indicator for a crossing occurring inside a shared highway lane area',
   {
-    skip: 'Crossing markers have not landed yet. The crossing-heavy fixture test above already records a real-crossing-count baseline via context.diagnostic for that phase to compare against.',
+    skip: 'Shared/highway corridor lanes do not exist until phase 4 of the routing epic, so there is no highway geometry for a crossing to occur inside yet.',
   },
   () => {},
 );
