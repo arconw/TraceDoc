@@ -2,13 +2,14 @@
 
 Source: `src/lib/map/routing.ts`.
 
-Deterministic obstacle-aware router over absolute compound geometry. Allocates four-sided document ports, folder-boundary gateways, independent lanes, and Manhattan paths.
+Deterministic obstacle-aware router over absolute compound geometry. Allocates an explicit, structured `MapPort` per edge endpoint on the four document sides, folder-boundary gateways, independent lanes, and Manhattan paths.
 
 ## Contracts
 
 - `MapSide`, `MapPoint`, `MapRect` — geometry primitives.
 - `MapBoundaryGateway` — folder/side/point crossing record.
-- `MapRoute` — points, endpoint sides, ordered gateways.
+- `MapPort` — the explicit, structured per-edge port model: `id` (`<documentId>:<side>:<index>`, unique within that node/side), `documentId`, `linkId`, `direction` (`'source' | 'target'`), `side`, `index`/`count` (this port's rank and the total port count sharing that node/side), absolute `point`, and `offset` (0–1 fraction along the side, for CSS placement without recomputing geometry). One `MapPort` exists per edge endpoint; there is no reserved/unused port, so an idle node side with no edges has none.
+- `MapRoute` — points, endpoint sides, `sourcePort`/`targetPort`, ordered gateways.
 - `RoutableMapNode` — flow node geometry input.
 - `RouteDescriptor`, `RankedMember`, `HeapEntry` — internal route/group/search records.
 - `ZoneReservation` — a `ZoneRouter`/points pair recorded while one link's descriptor is being built, so a later failure in that same descriptor can undo exactly the reservations it made.
@@ -53,14 +54,17 @@ Lead/gateway points are constructed by moving a port outward by the same clearan
 - `portPoint(...)`, `gatewayPoint(...)`, `pointOnRect(...)` — convert rank to concrete border coordinate.
 - `distributedOffset(...)` — spreads lanes within available span.
 - `movePoint(point,side,distance)` — moves outward/inward by side.
+- `buildMapPort(documentId,linkId,direction,side,rect,rank,point)` — assembles one `MapPort` from a resolved rank/point; called once per endpoint by `routeDescriptor`.
+- `sideOffset(rect,side,point)` — converts an absolute border point back to a 0–1 fraction of that side's length, clamped; feeds `MapPort.offset`.
+- `portKey(documentId,side)` — the port congestion-group key: **only** `documentId`+`side`, deliberately not direction. `buildPortGroups` registers both a link's source-role and target-role membership under this key, so every edge touching one side of one node — whether it originates or terminates there — is ranked in a single shared sequence and gets a strictly distinct `index`/offset. This is what makes a high-degree node's combined incoming+outgoing boundary collision-free (see the `mixed-hub` fixture's 16 distinct endpoints): ranking source and target separately, as an earlier version of this router did, let an edge of one direction land on the exact point of an edge of the other direction whenever both independently chose the same side.
 
 ## Geometry helpers
 
 - `appendRoute`, `compactPoints`, `deduplicatePoints`, `pushPoint` — join and normalize polylines.
 - `inflateRect`, `insetRect`, `pointInsideRect` — obstacle/container geometry.
 - `uniqueNumbers` — sorted coordinate grid.
-- `segmentKey`, `portKey`, `gatewayKey` — stable grouping/usage keys.
+- `segmentKey`, `gatewayKey` — stable grouping/usage keys (`portKey` is documented above, under lane allocation).
 - `perpendicularCenter`, `centerX`, `centerY`, `oppositeSide` — side geometry.
 - `entryBefore`, `compare` — deterministic heap/string ordering.
 
-Invariants: all segments orthogonal/finite; unrelated document interiors are never crossed; duplicate/self links remain independent; boundary order follows hierarchy; a single genuinely unroutable link is skipped with a logged diagnostic rather than aborting `routeMapLinks` for the rest of the graph; a link that fails partway through a multi-zone route never leaves behind reservations for the zones it did successfully cross, so later links sharing those zones are never penalized or detoured for segments belonging to an edge that is never rendered.
+Invariants: all segments orthogonal/finite; unrelated document interiors are never crossed; duplicate/self links remain independent; boundary order follows hierarchy; every edge endpoint on a document resolves to a distinct `MapPort` — no two edges on the same node side, regardless of direction, ever share an `index`/point; a single genuinely unroutable link is skipped with a logged diagnostic rather than aborting `routeMapLinks` for the rest of the graph; a link that fails partway through a multi-zone route never leaves behind reservations for the zones it did successfully cross, so later links sharing those zones are never penalized or detoured for segments belonging to an edge that is never rendered.

@@ -1647,7 +1647,7 @@ function sideFromHandle(handle, prefix) {
   if (typeof handle !== 'string' || !handle.startsWith(`${prefix}-`)) {
     return null;
   }
-  const side = handle.slice(prefix.length + 1);
+  const side = handle.slice(prefix.length + 1).split('-')[0];
   return MAP_SIDES.has(side) ? side : null;
 }
 
@@ -1683,6 +1683,116 @@ function assertValidArrowAndPorts(layout, slug) {
     assert.ok(
       movesTowardSide(points.at(-1), points.at(-2), targetSide),
       `${slug}: ${edge.id} enters its target from a direction inconsistent with its target handle side`,
+    );
+  }
+}
+
+function assertExplicitPortModel(layout, slug) {
+  const groups = new Map();
+
+  for (const edge of layout.edges) {
+    const points = edge.data.points;
+    const endpoints = [
+      ['source', edge.data.sourcePort, points[0], edge.source],
+      ['target', edge.data.targetPort, points.at(-1), edge.target],
+    ];
+
+    for (const [direction, port, expectedPoint, documentId] of endpoints) {
+      assert.ok(port, `${slug}: ${edge.id} is missing its ${direction} port`);
+      assert.equal(
+        port.direction,
+        direction,
+        `${slug}: ${edge.id} ${direction} port has the wrong direction`,
+      );
+      assert.equal(
+        port.documentId,
+        documentId,
+        `${slug}: ${edge.id} ${direction} port documentId does not match its edge endpoint`,
+      );
+      assert.equal(
+        port.linkId,
+        edge.id,
+        `${slug}: ${edge.id} ${direction} port linkId does not match its own edge`,
+      );
+      assert.deepEqual(
+        port.point,
+        expectedPoint,
+        `${slug}: ${edge.id} ${direction} port point does not match its route endpoint`,
+      );
+      assert.ok(
+        port.offset >= 0 && port.offset <= 1,
+        `${slug}: ${edge.id} ${direction} port offset ${port.offset} is out of [0,1]`,
+      );
+      assert.equal(
+        direction === 'source' ? edge.sourceHandle : edge.targetHandle,
+        `${direction}-${port.side}-${port.index}`,
+        `${slug}: ${edge.id} ${direction} handle does not match its own port`,
+      );
+
+      const key = `${port.documentId}:${port.side}`;
+      const group = groups.get(key) ?? new Map();
+      assert.ok(
+        !group.has(port.index),
+        `${slug}: ${key} has two ports sharing index ${port.index}`,
+      );
+      group.set(port.index, port);
+      groups.set(key, group);
+    }
+  }
+
+  for (const [key, group] of groups) {
+    const indices = [...group.keys()].sort((left, right) => left - right);
+    assert.deepEqual(
+      indices,
+      indices.map((_, index) => index),
+      `${slug}: ${key} port indices are not a contiguous 0..count-1 range`,
+    );
+    for (const port of group.values()) {
+      assert.equal(
+        port.count,
+        indices.length,
+        `${slug}: ${key} port count does not match its group size`,
+      );
+    }
+  }
+}
+
+function perpendicularCenter(rect, side) {
+  return side === 'left' || side === 'right'
+    ? rect.y + rect.height / 2
+    : rect.x + rect.width / 2;
+}
+
+function assertSpatialPortOrder(layout, documentId, side, slug) {
+  const rects = absoluteRectangles(layout);
+  const members = [];
+
+  for (const edge of layout.edges) {
+    if (
+      edge.data.sourcePort.documentId === documentId &&
+      edge.data.sourcePort.side === side
+    ) {
+      members.push({
+        index: edge.data.sourcePort.index,
+        center: perpendicularCenter(rects[edge.target], side),
+      });
+    }
+    if (
+      edge.data.targetPort.documentId === documentId &&
+      edge.data.targetPort.side === side
+    ) {
+      members.push({
+        index: edge.data.targetPort.index,
+        center: perpendicularCenter(rects[edge.source], side),
+      });
+    }
+  }
+
+  members.sort((left, right) => left.index - right.index);
+  for (let index = 1; index < members.length; index += 1) {
+    assert.ok(
+      members[index].center >= members[index - 1].center,
+      `${slug}: ${documentId}:${side} ports do not preserve the spatial order of their neighboring documents`,
     );
   }
 }
@@ -1765,10 +1875,19 @@ test(
       first.edges.forEach(assertRouteGeometry);
       assertAvoidsDocumentInteriors(first);
       assertValidArrowAndPorts(first, fixture.slug);
+      assertExplicitPortModel(first, fixture.slug);
       assert.deepEqual(
         first.edges.map((edge) => edge.data.points),
         second.edges.map((edge) => edge.data.points),
         `${fixture.slug} routed non-deterministically`,
+      );
+      assert.deepEqual(
+        first.edges.map((edge) => [edge.data.sourcePort, edge.data.targetPort]),
+        second.edges.map((edge) => [
+          edge.data.sourcePort,
+          edge.data.targetPort,
+        ]),
+        `${fixture.slug} assigned ports non-deterministically`,
       );
       assert.deepEqual(
         first.nodes.map((node) => [node.id, node.position.x, node.position.y]),
@@ -1836,14 +1955,15 @@ test(
 );
 
 test(
-  'keeps inbound and outbound lanes on the mixed hub independently ordered within each direction',
+  'keeps inbound and outbound lanes on the mixed hub independently ordered, and collision-free combined across both directions',
   { timeout: 60_000 },
-  async (context) => {
+  async () => {
     const fixture = routingFixtureBySlug('mixed-hub');
     const graph = projectToMapGraph(buildFixtureProject(fixture));
     const layout = await layoutMapGraph(graph, new ELK());
 
     assert.equal(layout.edges.length, 16);
+    assertExplicitPortModel(layout, 'mixed-hub');
     const outgoing = layout.edges.filter(
       (edge) => edge.source === 'document:hub.md',
     );
@@ -1868,9 +1988,61 @@ test(
       ...outgoing.map((edge) => JSON.stringify(edge.data.points[0])),
       ...incoming.map((edge) => JSON.stringify(edge.data.points.at(-1))),
     ];
-    const distinctAcrossDirections = new Set(allHubEndpoints).size;
+    assert.equal(
+      new Set(allHubEndpoints).size,
+      16,
+      'every one of the 16 hub endpoints must be distinct across both directions combined: the merged port ranking (routing.ts portKey) must never let an incoming and an outgoing edge share the same physical point on the same side',
+    );
+
+    for (const side of ['top', 'right', 'bottom', 'left']) {
+      assertSpatialPortOrder(layout, 'document:hub.md', side, 'mixed-hub');
+    }
+  },
+);
+
+test(
+  'routes the fan-converge fixture as an organized trunk with distinct per-target ports',
+  { timeout: 60_000 },
+  async (context) => {
+    const fixture = routingFixtureBySlug('fan-converge');
+    const graph = projectToMapGraph(buildFixtureProject(fixture));
+    const layout = await layoutMapGraph(graph, new ELK());
+
+    assert.equal(layout.edges.length, 20);
+    assertExplicitPortModel(layout, 'fan-converge');
+
+    const byTarget = new Map();
+    for (const edge of layout.edges) {
+      const list = byTarget.get(edge.target) ?? [];
+      list.push(edge);
+      byTarget.set(edge.target, list);
+    }
+    assert.equal(
+      byTarget.size,
+      5,
+      'fan-converge must resolve to exactly 5 distinct targets',
+    );
+    for (const [targetId, edges] of byTarget) {
+      assert.equal(
+        edges.length,
+        4,
+        `${targetId} must receive exactly 4 incoming edges`,
+      );
+      assert.equal(
+        new Set(edges.map((edge) => JSON.stringify(edge.data.points.at(-1))))
+          .size,
+        4,
+        `${targetId} must land every incoming edge on a distinct port`,
+      );
+    }
+
+    const crossings = countRouteCrossings(layout.edges);
     context.diagnostic(
-      `mixed-hub: ${distinctAcrossDirections}/16 hub endpoints are distinct across both directions combined (ports phase will make this 16/16)`,
+      `fan-converge fixture: ${crossings} real geometric segment crossings across 20 edges`,
+    );
+    assert.ok(
+      crossings < layout.edges.length,
+      'fan-converge must stay a readable, mostly crossing-free organized trunk rather than a tangle',
     );
   },
 );
@@ -1941,13 +2113,158 @@ test(
   },
 );
 
-test(
-  'assigns an explicit, structured port model to every route endpoint',
-  {
-    skip: 'Explicit MapPort objects land with the ports phase; the current router only distributes lane offsets along a side (routing.ts distributedOffset/portPoint).',
-  },
-  () => {},
-);
+function portModelFixture() {
+  const folder = {
+    id: 'folder:zone',
+    name: 'zone',
+    path: 'zone',
+    parentId: null,
+    childFolderIds: [],
+    documentIds: [
+      'document:hub',
+      'document:a',
+      'document:b',
+      'document:c',
+      'document:d',
+    ],
+  };
+  const documents = [
+    routableDocument('document:hub', folder.id, 'Hub'),
+    routableDocument('document:a', folder.id, 'A'),
+    routableDocument('document:b', folder.id, 'B'),
+    routableDocument('document:c', folder.id, 'C'),
+    routableDocument('document:d', folder.id, 'D'),
+  ];
+  // A, B, and C each link into the hub (target role); the hub links out to D
+  // (source role). A, B, C, and D sit, top to bottom, on the same side of
+  // the hub, so all four edges compete for the same physical side and must
+  // be ranked into one merged, direction-independent sequence.
+  const links = [
+    routableLink('link:a', 'document:a', 'document:hub'),
+    routableLink('link:b', 'document:b', 'document:hub'),
+    routableLink('link:c', 'document:c', 'document:hub'),
+    routableLink('link:d', 'document:hub', 'document:d'),
+  ];
+  const graph = routableGraph([folder], documents, links);
+  const nodes = [
+    {
+      id: folder.id,
+      position: { x: 0, y: 0 },
+      width: 600,
+      height: 420,
+      data: { kind: 'folder' },
+    },
+    {
+      id: 'document:hub',
+      parentId: folder.id,
+      position: { x: 300, y: 150 },
+      width: 100,
+      height: 50,
+      data: { kind: 'document' },
+    },
+    {
+      id: 'document:a',
+      parentId: folder.id,
+      position: { x: 20, y: 20 },
+      width: 100,
+      height: 50,
+      data: { kind: 'document' },
+    },
+    {
+      id: 'document:b',
+      parentId: folder.id,
+      position: { x: 20, y: 120 },
+      width: 100,
+      height: 50,
+      data: { kind: 'document' },
+    },
+    {
+      id: 'document:c',
+      parentId: folder.id,
+      position: { x: 20, y: 220 },
+      width: 100,
+      height: 50,
+      data: { kind: 'document' },
+    },
+    {
+      id: 'document:d',
+      parentId: folder.id,
+      position: { x: 20, y: 320 },
+      width: 100,
+      height: 50,
+      data: { kind: 'document' },
+    },
+  ];
+  return { graph, nodes };
+}
+
+test('assigns an explicit, structured port model to every route endpoint', () => {
+  const { graph, nodes } = portModelFixture();
+  const first = routeMapLinks(graph, nodes);
+  const second = routeMapLinks(graph, nodes);
+
+  assert.deepEqual(first, second, 'port assignment must be deterministic');
+
+  for (const linkId of ['link:a', 'link:b', 'link:c', 'link:d']) {
+    const route = first[linkId];
+    assert.ok(route, `${linkId} did not route`);
+    for (const [direction, port] of [
+      ['source', route.sourcePort],
+      ['target', route.targetPort],
+    ]) {
+      assert.equal(typeof port.id, 'string');
+      assert.equal(port.direction, direction);
+      assert.equal(port.linkId, linkId);
+      assert.ok(Number.isInteger(port.index) && port.index >= 0);
+      assert.ok(Number.isInteger(port.count) && port.count >= 1);
+      assert.ok(port.offset >= 0 && port.offset <= 1);
+    }
+  }
+
+  assert.equal(first['link:a'].sourcePort.direction, 'source');
+  assert.equal(first['link:a'].targetPort.direction, 'target');
+  assert.equal(first['link:a'].targetPort.documentId, 'document:hub');
+  assert.equal(first['link:d'].sourcePort.documentId, 'document:hub');
+
+  // A, B, C (target-role) and D (source-role, via the hub's outgoing edge)
+  // all land on the hub's left side, so this is exactly the mixed-direction
+  // congestion the merged port ranking must resolve.
+  const hubLeftPorts = [
+    first['link:a'].targetPort,
+    first['link:b'].targetPort,
+    first['link:c'].targetPort,
+    first['link:d'].sourcePort,
+  ];
+  assert.ok(
+    hubLeftPorts.every((port) => port.side === 'left'),
+    'fixture setup expected all four edges on the hub’s left side',
+  );
+  assert.equal(
+    new Set(hubLeftPorts.map((port) => port.index)).size,
+    4,
+    'every edge on the hub’s left side must have a distinct index regardless of direction',
+  );
+  assert.ok(
+    hubLeftPorts.every((port) => port.count === 4),
+    'every port sharing the hub’s left side must report the same total count',
+  );
+  assert.deepEqual(
+    [...hubLeftPorts].sort((left, right) => left.index - right.index),
+    hubLeftPorts,
+    'A, B, C, D were declared in their spatial (top-to-bottom) order, so ranked index order must already match',
+  );
+
+  const layout = {
+    nodes,
+    edges: Object.keys(first).map((linkId) => ({
+      id: linkId,
+      source: graph.links.find((link) => link.id === linkId).sourceDocumentId,
+      target: graph.links.find((link) => link.id === linkId).targetDocumentId,
+      data: first[linkId],
+    })),
+  };
+  assertSpatialPortOrder(layout, 'document:hub', 'left', 'port-model');
+});
 
 test(
   'renders directional chevrons along each route',

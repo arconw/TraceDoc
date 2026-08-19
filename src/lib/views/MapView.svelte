@@ -135,6 +135,7 @@
           tracedEdge,
           connectedDocumentIds,
         ),
+        activeEdgeId: tracedEdge?.id ?? null,
         onOpenDocument,
         onTraceDocument: traceDocument,
         onTraceDocumentUnmount: traceDocumentUnmount,

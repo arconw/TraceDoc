@@ -1,7 +1,8 @@
 <script lang="ts">
   import { Handle, Position } from '@xyflow/svelte';
   import { onDestroy } from 'svelte';
-  import type { MapNodeData } from '../map/elk-layout';
+  import { mapHandleId, type MapNodeData } from '../map/elk-layout';
+  import type { MapPort } from '../map/routing';
 
   export let data: MapNodeData;
   export let selected: boolean;
@@ -9,14 +10,29 @@
   let hovered = false;
   let focused = false;
 
-  const ports = [
-    { side: 'top', position: Position.Top },
-    { side: 'right', position: Position.Right },
-    { side: 'bottom', position: Position.Bottom },
-    { side: 'left', position: Position.Left },
-  ] as const;
+  const SIDE_POSITIONS = {
+    top: Position.Top,
+    right: Position.Right,
+    bottom: Position.Bottom,
+    left: Position.Left,
+  } as const;
 
+  $: ports = data.ports ?? [];
+  $: nodeEmphasized = data.emphasis === 'active';
   $: relationshipSummary = `${data.incomingCount ?? 0} incoming, ${data.outgoingCount ?? 0} outgoing links`;
+
+  function portClass(port: MapPort) {
+    if (port.linkId === data.activeEdgeId) return 'map-port map-port-active';
+    if (nodeEmphasized) return 'map-port map-port-emphasized';
+    return 'map-port';
+  }
+
+  function portStyle(port: MapPort) {
+    const percent = `${(port.offset * 100).toFixed(3)}%`;
+    return port.side === 'top' || port.side === 'bottom'
+      ? `left: ${percent}`
+      : `top: ${percent}`;
+  }
 
   function openDocument() {
     if (data.documentId) data.onOpenDocument?.(data.documentId);
@@ -43,22 +59,13 @@
   });
 </script>
 
-{#each ports as port (port.side)}
+{#each ports as port (port.id)}
   <Handle
-    id={`target-${port.side}`}
-    class="map-handle"
-    type="target"
-    position={port.position}
-    isConnectable={false}
-    aria-hidden="true"
-    role="presentation"
-    tabindex={-1}
-  />
-  <Handle
-    id={`source-${port.side}`}
-    class="map-handle"
-    type="source"
-    position={port.position}
+    id={mapHandleId(port)}
+    class={portClass(port)}
+    type={port.direction}
+    position={SIDE_POSITIONS[port.side]}
+    style={portStyle(port)}
     isConnectable={false}
     aria-hidden="true"
     role="presentation"
@@ -177,18 +184,44 @@
     font-size: 0.625rem;
   }
 
-  :global(.map-handle) {
-    width: 0.4rem;
-    height: 0.4rem;
+  :global(.map-port) {
+    width: 0.32rem;
+    height: 0.32rem;
     border: 1px solid var(--color-map-edge);
     background: var(--color-map-document);
-    opacity: 0;
+    opacity: 0.4;
     pointer-events: none;
-    transition: opacity 90ms ease;
+    transition:
+      opacity 90ms ease,
+      width 90ms ease,
+      height 90ms ease,
+      background 90ms ease,
+      border-color 90ms ease;
   }
 
-  :global(.svelte-flow__node-mapDocument:hover .map-handle),
-  :global(.svelte-flow__node-mapDocument:focus-within .map-handle) {
-    opacity: 0.8;
+  :global(.svelte-flow__node-mapDocument:hover .map-port),
+  :global(.svelte-flow__node-mapDocument:focus-within .map-port),
+  :global(.map-port-emphasized) {
+    opacity: 0.85;
+  }
+
+  :global(.map-port-active) {
+    width: 0.46rem;
+    height: 0.46rem;
+    border-color: var(--color-map-edge-active);
+    background: var(--color-map-edge-active);
+    opacity: 1;
+  }
+
+  @media (forced-colors: active) {
+    :global(.map-port) {
+      border-color: CanvasText;
+      background: Canvas;
+    }
+
+    :global(.map-port-active) {
+      border-color: Highlight;
+      background: Highlight;
+    }
   }
 </style>

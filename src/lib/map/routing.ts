@@ -13,10 +13,24 @@ export interface MapBoundaryGateway {
   side: MapSide;
 }
 
+export interface MapPort {
+  id: string;
+  documentId: string;
+  linkId: string;
+  direction: 'source' | 'target';
+  side: MapSide;
+  index: number;
+  count: number;
+  point: MapPoint;
+  offset: number;
+}
+
 export interface MapRoute {
   points: MapPoint[];
   sourceSide: MapSide;
   targetSide: MapSide;
+  sourcePort: MapPort;
+  targetPort: MapPort;
   boundaryGateways: MapBoundaryGateway[];
 }
 
@@ -116,30 +130,49 @@ function routeDescriptor(
   gatewayGroups: Map<string, RankedMember[]>,
   descriptor: RouteDescriptor,
 ): MapRoute {
+  const sourceRank = rankFor(
+    portGroups,
+    portKey(descriptor.link.sourceDocumentId, descriptor.sourceSide),
+    descriptor.link.id,
+  );
   const sourcePoint = portPoint(
     descriptor.source,
     descriptor.sourceSide,
-    rankFor(
-      portGroups,
-      portKey(descriptor.link.sourceDocumentId, descriptor.sourceSide, true),
-      descriptor.link.id,
-    ),
+    sourceRank,
+  );
+  const sourcePort = buildMapPort(
+    descriptor.link.sourceDocumentId,
+    descriptor.link.id,
+    'source',
+    descriptor.sourceSide,
+    descriptor.source,
+    sourceRank,
+    sourcePoint,
+  );
+  const targetRank = rankFor(
+    portGroups,
+    portKey(descriptor.link.targetDocumentId, descriptor.targetSide),
+    descriptor.link.id,
   );
   const targetPoint = portPoint(
     descriptor.target,
     descriptor.targetSide,
-    rankFor(
-      portGroups,
-      portKey(descriptor.link.targetDocumentId, descriptor.targetSide, false),
-      descriptor.link.id,
-    ),
+    targetRank,
+  );
+  const targetPort = buildMapPort(
+    descriptor.link.targetDocumentId,
+    descriptor.link.id,
+    'target',
+    descriptor.targetSide,
+    descriptor.target,
+    targetRank,
+    targetPoint,
   );
   const points = [sourcePoint];
   const boundaryGateways: MapBoundaryGateway[] = [];
   const reservations: ZoneReservation[] = [];
   let current = movePoint(sourcePoint, descriptor.sourceSide, ROUTE_CLEARANCE);
-  let currentZone =
-    graph.documents[descriptor.link.sourceDocumentId].parentId;
+  let currentZone = graph.documents[descriptor.link.sourceDocumentId].parentId;
   pushPoint(points, current);
 
   try {
@@ -195,7 +228,11 @@ function routeDescriptor(
       currentZone = folderId;
     }
 
-    const targetLead = movePoint(targetPoint, descriptor.targetSide, ROUTE_CLEARANCE);
+    const targetLead = movePoint(
+      targetPoint,
+      descriptor.targetSide,
+      ROUTE_CLEARANCE,
+    );
     appendRoute(
       points,
       routeSegment(zoneRouters[currentZone], current, targetLead, reservations),
@@ -216,6 +253,8 @@ function routeDescriptor(
     points: deduplicatePoints(points),
     sourceSide: descriptor.sourceSide,
     targetSide: descriptor.targetSide,
+    sourcePort,
+    targetPort,
     boundaryGateways,
   };
 }
@@ -472,7 +511,8 @@ class ZoneRouter {
     for (let yIndex = 0; yIndex < height; yIndex += 1) {
       for (let xIndex = 0; xIndex < width; xIndex += 1) {
         const point = { x: xs[xIndex], y: ys[yIndex] };
-        if (this.pointValid(point, obstacles)) valid[yIndex * width + xIndex] = 1;
+        if (this.pointValid(point, obstacles))
+          valid[yIndex * width + xIndex] = 1;
       }
     }
 
@@ -649,13 +689,13 @@ function buildPortGroups(descriptors: RouteDescriptor[]) {
   for (const descriptor of descriptors) {
     addRankedMember(
       groups,
-      portKey(descriptor.link.sourceDocumentId, descriptor.sourceSide, true),
+      portKey(descriptor.link.sourceDocumentId, descriptor.sourceSide),
       descriptor.link.id,
       perpendicularCenter(descriptor.target, descriptor.sourceSide),
     );
     addRankedMember(
       groups,
-      portKey(descriptor.link.targetDocumentId, descriptor.targetSide, false),
+      portKey(descriptor.link.targetDocumentId, descriptor.targetSide),
       descriptor.link.id,
       perpendicularCenter(descriptor.source, descriptor.targetSide),
     );
@@ -748,6 +788,36 @@ function portPoint(
     side,
     distributedOffset(length / 2, length - PORT_INSET * 2, rank, PORT_SPACING),
   );
+}
+
+function buildMapPort(
+  documentId: string,
+  linkId: string,
+  direction: 'source' | 'target',
+  side: MapSide,
+  rect: MapRect,
+  rank: { index: number; count: number },
+  point: MapPoint,
+): MapPort {
+  return {
+    id: `${documentId}:${side}:${rank.index}`,
+    documentId,
+    linkId,
+    direction,
+    side,
+    index: rank.index,
+    count: rank.count,
+    point,
+    offset: sideOffset(rect, side, point),
+  };
+}
+
+function sideOffset(rect: MapRect, side: MapSide, point: MapPoint) {
+  const horizontalSide = side === 'left' || side === 'right';
+  const length = horizontalSide ? rect.height : rect.width;
+  if (length <= 0) return 0.5;
+  const local = horizontalSide ? point.y - rect.y : point.x - rect.x;
+  return Math.min(1, Math.max(0, local / length));
 }
 
 function gatewayPoint(
@@ -873,8 +943,8 @@ function segmentKey(source: MapPoint, target: MapPoint) {
   return `${first.x},${first.y}:${second.x},${second.y}`;
 }
 
-function portKey(documentId: string, side: MapSide, source: boolean) {
-  return `${documentId}:${side}:${source ? 'source' : 'target'}`;
+function portKey(documentId: string, side: MapSide) {
+  return `${documentId}:${side}`;
 }
 
 function gatewayKey(folderId: string, side: MapSide) {

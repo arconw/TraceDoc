@@ -158,6 +158,34 @@ function fanOutFixture(): RoutingFixture {
   };
 }
 
+function fanConvergeFixture(): RoutingFixture {
+  const targetCount = 5;
+  const targets = Array.from(
+    { length: targetCount },
+    (_, index) => `targets/module-${padded(index + 1)}.md`,
+  );
+  const sources: RoutingFixtureDocument[] = Array.from(
+    { length: 20 },
+    (_, index) =>
+      doc(
+        `sources/module-${padded(index + 1)}.md`,
+        `Source ${padded(index + 1)}`,
+        [targets[index % targetCount]],
+      ),
+  );
+  const documents: RoutingFixtureDocument[] = [
+    ...sources,
+    ...targets.map((path, index) => doc(path, `Target ${padded(index + 1)}`)),
+  ];
+  return {
+    slug: 'fan-converge',
+    name: 'Fan-converge',
+    invariant:
+      '20 independent source documents distribute across 5 shared targets (4 sources per target). Every edge must keep a distinct lane and a distinct endpoint along its target boundary, and the shared source-to-target corridor must stay readable as an organized trunk rather than a merged bundle.',
+    documents,
+  };
+}
+
 function denseCorridorFixture(): RoutingFixture {
   const documents: RoutingFixtureDocument[] = [];
   for (let index = 1; index <= 20; index += 1) {
@@ -344,6 +372,7 @@ function incrementalNextFixture(): RoutingFixture {
 export const ROUTING_FIXTURES: RoutingFixture[] = [
   fanInFixture(),
   fanOutFixture(),
+  fanConvergeFixture(),
   denseCorridorFixture(),
   bidirectionalCorridorFixture(),
   crossFolderHighwayFixture(),

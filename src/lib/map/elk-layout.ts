@@ -5,6 +5,7 @@ import {
   routeMapLinks,
   type MapBoundaryGateway,
   type MapPoint,
+  type MapPort,
   type MapSide,
 } from './routing';
 
@@ -22,7 +23,9 @@ export interface MapNodeData extends Record<string, unknown> {
   documentId?: string;
   incomingCount?: number;
   outgoingCount?: number;
+  ports?: MapPort[];
   emphasis?: 'normal' | 'active' | 'connected' | 'muted';
+  activeEdgeId?: string | null;
   onOpenDocument?: (documentId: string) => void;
   onTraceDocument?: (documentId: string | null) => void;
   onTraceDocumentUnmount?: (documentId: string) => void;
@@ -35,6 +38,8 @@ export interface MapEdgeData extends Record<string, unknown> {
   targetDocumentId: string;
   sourceSide: MapSide;
   targetSide: MapSide;
+  sourcePort: MapPort;
+  targetPort: MapPort;
   boundaryGateways: MapBoundaryGateway[];
   ariaLabel: string;
   emphasis?: 'normal' | 'active' | 'muted';
@@ -131,6 +136,7 @@ export function elkGraphToFlow(graph: MapGraph, layout: ElkMapNode): MapLayout {
 
   visit(layout.children ?? []);
   const routes = routeMapLinks(graph, nodes);
+  attachDocumentPorts(nodes, routes);
 
   return {
     nodes,
@@ -144,8 +150,8 @@ export function elkGraphToFlow(graph: MapGraph, layout: ElkMapNode): MapLayout {
           id: link.id,
           source: link.sourceDocumentId,
           target: link.targetDocumentId,
-          sourceHandle: `source-${route.sourceSide}`,
-          targetHandle: `target-${route.targetSide}`,
+          sourceHandle: mapHandleId(route.sourcePort),
+          targetHandle: mapHandleId(route.targetPort),
           type: 'mapRoute' as const,
           zIndex: 1,
           markerEnd: {
@@ -364,6 +370,35 @@ function fixedSidePorts(nodeId: string) {
       'elk.port.side': side.toUpperCase(),
     },
   }));
+}
+
+export function mapHandleId(port: MapPort) {
+  return `${port.direction}-${port.side}-${port.index}`;
+}
+
+function attachDocumentPorts(
+  nodes: MapFlowNode[],
+  routes: Record<string, { sourcePort: MapPort; targetPort: MapPort }>,
+) {
+  const portsByNode = new Map<string, MapPort[]>();
+  for (const route of Object.values(routes)) {
+    for (const port of [route.sourcePort, route.targetPort]) {
+      const existing = portsByNode.get(port.documentId) ?? [];
+      existing.push(port);
+      portsByNode.set(port.documentId, existing);
+    }
+  }
+  for (const node of nodes) {
+    if (node.data.kind !== 'document') continue;
+    const ports = portsByNode.get(node.id) ?? [];
+    ports.sort(
+      (left, right) =>
+        left.side.localeCompare(right.side) ||
+        left.index - right.index ||
+        left.direction.localeCompare(right.direction),
+    );
+    node.data.ports = ports;
+  }
 }
 
 function linkCounts(
